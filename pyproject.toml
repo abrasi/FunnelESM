@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "funnel-esm"
+version = "0.1.0"
+description = "Inter-layer sequence reduction experiments with ESM-2."
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=0.30",
+    "datasets>=2.19",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "torch>=2.2",
+    "transformers>=4.44",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
