@@ -1,7 +1,7 @@
 """Metrics used by Hugging Face Trainer."""
 
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, jaccard_score
 
 
 def compute_metrics(eval_prediction):
@@ -17,4 +17,9 @@ def compute_metrics(eval_prediction):
         "micro_f1": f1_score(
             labels, predictions, average="micro", zero_division=0
         ),
+        "jaccard": jaccard_score(
+            labels, predictions, average="samples", zero_division=0
+        ),
+        "accuracy": float(np.all(predictions == labels, axis=1).mean()),
+        "num_labels_predicted": float(predictions.sum(axis=1).mean()),
     }

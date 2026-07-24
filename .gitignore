@@ -8,4 +8,6 @@ data/
 outputs/
 checkpoints/
 wandb/
-
+*.egg-info/
+.vscode
+*.log
