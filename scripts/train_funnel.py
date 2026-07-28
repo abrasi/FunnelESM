@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train ESM-2 with one masked-mean inter-layer reduction."""
+"""Train ESM-2 with masked-mean inter-layer reductions."""
 
 from transformers import AutoConfig
 
@@ -8,6 +8,7 @@ from funnel_esm.modeling_funnel_esm import (
     FunnelEsmForSequenceClassification,
 )
 from train_baseline import build_parser, run
+
 
 ROPE_KEY_MAPPING = {
     "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
@@ -18,16 +19,17 @@ ROPE_KEY_MAPPING = {
 def parse_args():
     parser = build_parser()
     parser.description = (
-        "Train ESM-2 with one masked-mean inter-layer reduction."
+        "Train ESM-2 with masked-mean inter-layer reductions."
     )
     parser.set_defaults(output_dir="outputs/funnel_mean")
     parser.add_argument(
-        "--pool_after_layer",
+        "--pool_after_layers",
         type=int,
+        nargs="+",
         default=None,
         help=(
-            "1-based layer after which sequence pooling is applied. "
-            "Defaults to the middle layer."
+            "Sorted 1-based layers after which pooling is applied. "
+            "For example: --pool_after_layers 4 8."
         ),
     )
     return parser.parse_args()
@@ -35,13 +37,13 @@ def parse_args():
 
 def load_funnel_model(args):
     config = AutoConfig.from_pretrained(args.model_name)
-    pool_after_layer = (
-        args.pool_after_layer
-        if args.pool_after_layer is not None
-        else config.num_hidden_layers // 2
+    pool_after_layers = (
+        args.pool_after_layers
+        if args.pool_after_layers is not None
+        else [config.num_hidden_layers // 2]
     )
 
-    config.funnel_pool_after_layer = pool_after_layer
+    config.funnel_pool_after_layers = pool_after_layers
     config.funnel_pooling_type = "pairwise_masked_mean"
     config.num_labels = len(DEEPLOC_LABELS)
     config.problem_type = "multi_label_classification"

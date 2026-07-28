@@ -22,17 +22,22 @@ class FunnelEsmModel(EsmModel):
     def __init__(self, config, add_pooling_layer=True):
         super().__init__(config, add_pooling_layer=add_pooling_layer)
 
-        self.pool_after_layer = getattr(
+        pool_after_layers = getattr(
             config,
-            "funnel_pool_after_layer",
-            config.num_hidden_layers // 2,
+            "funnel_pool_after_layers",
+            None,
         )
 
-        if not 1 <= self.pool_after_layer < config.num_hidden_layers:
-            raise ValueError(
-                "funnel_pool_after_layer must be between 1 and "
-                "num_hidden_layers - 1"
-            )
+        if pool_after_layers is None:
+            pool_after_layers = [
+                getattr(
+                    config,
+                    "funnel_pool_after_layer",
+                    config.num_hidden_layers // 2,
+                )
+            ]
+
+        self.pool_after_layers = tuple(pool_after_layers)
 
         self.sequence_pooler = MaskedMeanPool1d()
 
@@ -131,7 +136,7 @@ class FunnelEsmModel(EsmModel):
                 **kwargs,
             )
 
-            if layer_number == self.pool_after_layer:
+            if layer_number in self.pool_after_layers:
                 hidden_states, attention_mask, position_ids = (
                     self.sequence_pooler(
                         hidden_states,
@@ -353,13 +358,16 @@ class FunnelEsmPoolQueryModel(FunnelEsmModel):
             encoder_attention_mask,
         )
 
-        transition_layer = self.pool_after_layer + 1
+        transition_layers = {
+            layer_number + 1
+            for layer_number in self.pool_after_layers
+        }
 
         for layer_number, layer_module in enumerate(
             self.encoder.layer,
             start=1,
         ):
-            if layer_number == transition_layer:
+            if layer_number in transition_layers:
                 full_states = hidden_states
                 full_mask = attention_mask
                 full_positions = position_ids

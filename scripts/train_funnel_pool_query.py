@@ -23,26 +23,28 @@ def parse_args():
     )
     parser.set_defaults(output_dir="outputs/funnel_pool_query")
     parser.add_argument(
-        "--pool_after_layer",
+        "--pool_after_layers",
         type=int,
+        nargs="+",
         default=None,
         help=(
             "1-based layer after which Q is pooled. "
             "Defaults to the middle layer."
         ),
     )
+
     return parser.parse_args()
 
 
 def load_pool_query_model(args):
     config = AutoConfig.from_pretrained(args.model_name)
-    pool_after_layer = (
-        args.pool_after_layer
-        if args.pool_after_layer is not None
-        else config.num_hidden_layers // 2
+    pool_after_layers = (
+        args.pool_after_layers
+        if args.pool_after_layers is not None
+        else [config.num_hidden_layers // 2]
     )
 
-    config.funnel_pool_after_layer = pool_after_layer
+    config.funnel_pool_after_layers = pool_after_layers
     config.funnel_pool_stride = 2
     config.funnel_pooling_type = "pool_query_only_mean"
     config.num_labels = len(DEEPLOC_LABELS)
