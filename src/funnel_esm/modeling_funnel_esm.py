@@ -1,4 +1,4 @@
-"""A minimal ESM-2 variant with one inter-layer sequence reduction."""
+"""Minimal ESM-2 variants with inter-layer sequence reductions."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from funnel_esm.pooling import MaskedMeanPool1d
 
 
 class FunnelEsmModel(EsmModel):
-    """Reuse Hugging Face ESM layers and reduce sequence length once."""
+    """Reuse Hugging Face ESM layers and reduce sequence length."""
 
     def __init__(self, config, add_pooling_layer=True):
         super().__init__(config, add_pooling_layer=add_pooling_layer)
@@ -27,7 +27,6 @@ class FunnelEsmModel(EsmModel):
             "funnel_pool_after_layers",
             None,
         )
-
         if pool_after_layers is None:
             pool_after_layers = [
                 getattr(
@@ -38,6 +37,23 @@ class FunnelEsmModel(EsmModel):
             ]
 
         self.pool_after_layers = tuple(pool_after_layers)
+
+        if not self.pool_after_layers:
+            raise ValueError("funnel_pool_after_layers cannot be empty")
+        if len(set(self.pool_after_layers)) != len(
+            self.pool_after_layers
+        ):
+            raise ValueError("funnel_pool_after_layers contains duplicates")
+        if tuple(sorted(self.pool_after_layers)) != self.pool_after_layers:
+            raise ValueError("funnel_pool_after_layers must be sorted")
+        if any(
+            layer < 1 or layer >= config.num_hidden_layers
+            for layer in self.pool_after_layers
+        ):
+            raise ValueError(
+                "Each pooling layer must be between 1 and "
+                "num_hidden_layers - 1"
+            )
 
         self.sequence_pooler = MaskedMeanPool1d()
 
@@ -196,7 +212,7 @@ def _apply_rope(
 
 
 class FunnelEsmPoolQueryModel(FunnelEsmModel):
-    """ESM-2 with one FunnelTransformer-style pool-query-only layer."""
+    """ESM-2 with FunnelTransformer-style pool-query-only transitions."""
 
     def __init__(self, config, add_pooling_layer=True):
         super().__init__(config, add_pooling_layer=add_pooling_layer)
@@ -433,7 +449,7 @@ class FunnelEsmPoolQueryModel(FunnelEsmModel):
 class FunnelEsmPoolQueryForSequenceClassification(
     EsmForSequenceClassification
 ):
-    """Sequence classifier with one pool-query-only transition."""
+    """Sequence classifier with pool-query-only transitions."""
 
     def __init__(self, config):
         super().__init__(config)

@@ -51,6 +51,25 @@ def build_parser():
         "--model_name",
         default="facebook/esm2_t12_35M_UR50D",
     )
+    parser.add_argument(
+        "--folds",
+        type=int,
+        nargs="+",
+        choices=range(5),
+        default=None,
+        metavar="FOLD",
+        help=(
+            "DeepLoc folds to run (0-4). By default, run all five folds."
+        ),
+    )
+    parser.add_argument(
+        "--eval_each_epoch",
+        action="store_true",
+        help=(
+            "Evaluate after every epoch and save the resulting learning "
+            "curve. Intended for convergence pilots."
+        ),
+    )
     return parser
 
 
@@ -89,7 +108,8 @@ def aggregate_resources(energy_j, time_s, memory_gb):
 
 def train_fold(args, tokenizer, fold, model_loader=load_model):
     """Train one fold and return its metrics on the main process."""
-    set_seed(args.seed)
+    fold_seed = args.seed + fold
+    set_seed(fold_seed)
     fold_output_dir = Path(args.output_dir) / f"fold_{fold}"
 
     datasets = load_deeploc(
@@ -109,11 +129,12 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        eval_strategy="no",
+        eval_strategy="epoch" if args.eval_each_epoch else "no",
+        logging_strategy="epoch" if args.eval_each_epoch else "no",
         save_strategy="no",
         report_to="none",
-        seed=args.seed,
-        data_seed=args.seed,
+        seed=fold_seed,
+        data_seed=fold_seed,
     )
 
     trainer = Trainer(
@@ -143,6 +164,13 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     trainer.train()
     measurement = monitor.end_window(window_name)
 
+    if trainer.is_world_process_zero() and args.eval_each_epoch:
+        history_path = fold_output_dir / "epoch_history.json"
+        history_path.write_text(
+            json.dumps(trainer.state.log_history, indent=2),
+            encoding="utf-8",
+        )
+
     local_peak_memory_gb = max(
         torch.cuda.max_memory_allocated(gpu_index)
         for gpu_index in monitored_gpus
@@ -170,7 +198,10 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
 
     fold_result = None
     if trainer.is_world_process_zero():
-        fold_result = {"fold": fold}
+        fold_result = {
+            "fold": fold,
+            "seed": fold_seed,
+        }
         fold_result.update({name: float(metrics[name]) for name in RESULT_NAMES})
 
     if dist.is_initialized():
@@ -189,7 +220,11 @@ def summarize_results(fold_results):
         values = [result[name] for result in fold_results]
         summary[name] = {
             "mean": float(np.mean(values)),
-            "std": float(np.std(values, ddof=1)),
+            "std": (
+                float(np.std(values, ddof=1))
+                if len(values) > 1
+                else None
+            ),
         }
     return summary
 
@@ -197,7 +232,13 @@ def summarize_results(fold_results):
 def print_summary(summary):
     print("\nResumen de validación cruzada (media ± desviación típica)")
     for name, values in summary.items():
-        print(f"{name}: {values['mean']:.6f} ± {values['std']:.6f}")
+        if values["std"] is None:
+            print(f"{name}: {values['mean']:.6f} (un solo fold)")
+        else:
+            print(
+                f"{name}: {values['mean']:.6f} "
+                f"± {values['std']:.6f}"
+            )
 
 
 def run(args, model_loader=load_model) -> None:
@@ -206,8 +247,9 @@ def run(args, model_loader=load_model) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     fold_results = []
+    folds = args.folds if args.folds is not None else range(5)
 
-    for fold in range(5):
+    for fold in folds:
         result = train_fold(args, tokenizer, fold, model_loader)
         if result is not None:
             fold_results.append(result)
@@ -215,6 +257,7 @@ def run(args, model_loader=load_model) -> None:
     if fold_results:
         summary = summarize_results(fold_results)
         results = {
+            "config": vars(args),
             "folds": fold_results,
             "summary": summary,
         }

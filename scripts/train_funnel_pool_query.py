@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train ESM-2 with one stride-2 pool-query-only transition."""
+"""Train ESM-2 with stride-2 pool-query-only transitions."""
 
 from transformers import AutoConfig
 
@@ -8,6 +8,7 @@ from funnel_esm.modeling_funnel_esm import (
     FunnelEsmPoolQueryForSequenceClassification,
 )
 from train_baseline import build_parser, run
+from train_funnel import resolve_pool_after_layers
 
 
 ROPE_KEY_MAPPING = {
@@ -19,29 +20,44 @@ ROPE_KEY_MAPPING = {
 def parse_args():
     parser = build_parser()
     parser.description = (
-        "Train ESM-2 with one stride-2 pool-query-only transition."
+        "Train ESM-2 with stride-2 pool-query-only transitions."
     )
     parser.set_defaults(output_dir="outputs/funnel_pool_query")
+    parser.add_argument(
+        "--pool_after_layer",
+        type=int,
+        default=None,
+        help=(
+            "Apply one Q pooling operation after this 1-based layer. "
+            "Kept for compatibility."
+        ),
+    )
     parser.add_argument(
         "--pool_after_layers",
         type=int,
         nargs="+",
         default=None,
         help=(
-            "1-based layer after which Q is pooled. "
-            "Defaults to the middle layer."
+            "Sorted 1-based layers after which Q is pooled, "
+            "for example: 4 8."
         ),
     )
-
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        args.pool_after_layer is not None
+        and args.pool_after_layers is not None
+    ):
+        parser.error(
+            "Use either --pool_after_layer or --pool_after_layers, not both."
+        )
+    return args
 
 
 def load_pool_query_model(args):
     config = AutoConfig.from_pretrained(args.model_name)
-    pool_after_layers = (
-        args.pool_after_layers
-        if args.pool_after_layers is not None
-        else [config.num_hidden_layers // 2]
+    pool_after_layers = resolve_pool_after_layers(
+        args,
+        config.num_hidden_layers,
     )
 
     config.funnel_pool_after_layers = pool_after_layers
