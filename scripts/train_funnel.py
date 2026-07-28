@@ -9,6 +9,11 @@ from funnel_esm.modeling_funnel_esm import (
 )
 from train_baseline import build_parser, run
 
+ROPE_KEY_MAPPING = {
+    "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
+        "esm.rotary_embeddings.inv_freq",
+}
+
 
 def parse_args():
     parser = build_parser()
@@ -48,6 +53,7 @@ def load_funnel_model(args):
     return FunnelEsmForSequenceClassification.from_pretrained(
         args.model_name,
         config=config,
+        key_mapping=ROPE_KEY_MAPPING,
     )
 
 

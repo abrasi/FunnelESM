@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an ESM-2 baseline on one DeepLoc 2.0 fold."""
+"""Train and evaluate the frozen ESM-2 baseline with 5-fold cross-validation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -40,7 +39,7 @@ RESULT_NAMES = (
 )
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", required=True)
     parser.add_argument("--output_dir", default="outputs/baseline")
@@ -52,7 +51,21 @@ def parse_args():
         "--model_name",
         default="facebook/esm2_t12_35M_UR50D",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args():
+    return build_parser().parse_args()
+
+
+def load_model(args):
+    return AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=len(DEEPLOC_LABELS),
+        problem_type="multi_label_classification",
+        id2label=dict(enumerate(DEEPLOC_LABELS)),
+        label2id={label: index for index, label in enumerate(DEEPLOC_LABELS)},
+    )
 
 
 def aggregate_resources(energy_j, time_s, memory_gb):
@@ -74,8 +87,7 @@ def aggregate_resources(energy_j, time_s, memory_gb):
     return energy.item(), run_time.item(), memory.item()
 
 
-
-def train_fold(args, tokenizer, fold):
+def train_fold(args, tokenizer, fold, model_loader=load_model):
     """Train one fold and return its metrics on the main process."""
     set_seed(args.seed)
     fold_output_dir = Path(args.output_dir) / f"fold_{fold}"
@@ -86,15 +98,8 @@ def train_fold(args, tokenizer, fold):
         validation_partition=fold,
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=len(DEEPLOC_LABELS),
-        problem_type="multi_label_classification",
-        id2label=dict(enumerate(DEEPLOC_LABELS)),
-        label2id={label: index for index, label in enumerate(DEEPLOC_LABELS)},
-    )
+    model = model_loader(args)
 
-    # Freeze the base model parameters so that only the classification head is trained
     for parameter in model.base_model.parameters():
         parameter.requires_grad = False
 
@@ -190,24 +195,20 @@ def summarize_results(fold_results):
 
 
 def print_summary(summary):
-    print("\nCross-Validation Summary (mean ± std)")
+    print("\nResumen de validación cruzada (media ± desviación típica)")
     for name, values in summary.items():
         print(f"{name}: {values['mean']:.6f} ± {values['std']:.6f}")
 
 
-
-def main() -> None:
-    args = parse_args()
-    
+def run(args, model_loader=load_model) -> None:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available.")
+        raise RuntimeError("Este script requiere al menos una GPU CUDA.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    
     fold_results = []
-    
+
     for fold in range(5):
-        result = train_fold(args, tokenizer, fold)
+        result = train_fold(args, tokenizer, fold, model_loader)
         if result is not None:
             fold_results.append(result)
 
@@ -226,7 +227,11 @@ def main() -> None:
             encoding="utf-8",
         )
         print_summary(summary)
-        print(f"\nResults saved to: {results_path}")
+        print(f"\nResultados guardados en: {results_path}")
+
+
+def main() -> None:
+    run(parse_args())
 
 
 if __name__ == "__main__":
