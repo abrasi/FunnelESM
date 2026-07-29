@@ -21,14 +21,15 @@ def load_deeploc(
     csv_path,
     tokenizer,
     validation_partition=0,
-    max_residues=1024,
+    max_residues=1022,
 ):
-    """Return tokenized train and validation datasets."""
+    """Return tokenized train and validation datasets.
+
+    Sequences longer than ``max_residues`` keep their N- and C-terminal
+    regions and lose only the middle of the sequence.
+    """
 
     dataset = load_dataset("csv", data_files=csv_path, split="train")
-    dataset = dataset.filter(
-        lambda example: len(example["Sequence"]) <= max_residues
-    )
 
     train_dataset = dataset.filter(
         lambda example: example["Partition"] != validation_partition
@@ -38,7 +39,21 @@ def load_deeploc(
     )
 
     def tokenize(batch):
-        encoded = tokenizer(batch["Sequence"], truncation=False)
+        left_residues = max_residues // 2
+        right_residues = max_residues - left_residues
+        sequences = [
+            (
+                sequence
+                if len(sequence) <= max_residues
+                else (
+                    sequence[:left_residues]
+                    + sequence[-right_residues:]
+                )
+            )
+            for sequence in batch["Sequence"]
+        ]
+
+        encoded = tokenizer(sequences, truncation=False)
         encoded["labels"] = [
             [float(batch[label][index]) for label in DEEPLOC_LABELS]
             for index in range(len(batch["Sequence"]))
