@@ -26,7 +26,8 @@ def load_deeploc(
     """Return tokenized train and validation datasets.
 
     Sequences longer than ``max_residues`` keep their N- and C-terminal
-    regions and lose only the middle of the sequence.
+    regions and lose only the middle of the sequence. The five official
+    DeepLoc partitions are preserved without recalculating the folds.
     """
 
     dataset = load_dataset("csv", data_files=csv_path, split="train")
@@ -60,18 +61,12 @@ def load_deeploc(
         ]
         return encoded
 
-    train_dataset = train_dataset.map(
-        tokenize,
-        batched=True,
-        remove_columns=train_dataset.column_names,
-    )
-    validation_dataset = validation_dataset.map(
-        tokenize,
-        batched=True,
-        remove_columns=validation_dataset.column_names,
-    )
-
-    return DatasetDict(
+    datasets = DatasetDict(
         train=train_dataset,
         validation=validation_dataset,
+    )
+    return datasets.map(
+        tokenize,
+        batched=True,
+        remove_columns=dataset.column_names,
     )
