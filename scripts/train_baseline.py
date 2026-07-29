@@ -105,6 +105,14 @@ def build_parser():
             "curve. Intended for convergence pilots."
         ),
     )
+    parser.add_argument(
+        "--convergence_pilot",
+        action="store_true",
+        help=(
+            "After collecting epoch curves, skip threshold calibration and "
+            "final model saving. Intended for LR/epoch selection only."
+        ),
+    )
     return parser
 
 
@@ -236,6 +244,26 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         local_peak_memory_gb,
     )
 
+    if args.convergence_pilot:
+        fold_result = None
+        if trainer.is_world_process_zero():
+            fold_result = {
+                "fold": fold,
+                "seed": fold_seed,
+                "train_gpu_energy_j": energy_j,
+                "train_gpu_energy_kwh": energy_j / 3_600_000,
+                "train_time_s": time_s,
+                "peak_gpu_memory_gb": memory_gb,
+            }
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        del trainer, model, datasets, monitor
+        gc.collect()
+        torch.cuda.empty_cache()
+        return fold_result
+
     trainer.compute_metrics = None
     calibration_window_name = f"fold_{fold}_threshold_calibration"
     monitor.begin_window(calibration_window_name)
@@ -346,6 +374,10 @@ def print_summary(summary):
 
 
 def run(args, model_loader=load_model) -> None:
+    if args.convergence_pilot and not args.eval_each_epoch:
+        raise ValueError(
+            "--convergence_pilot requires --eval_each_epoch"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("Este script requiere al menos una GPU CUDA.")
 
@@ -359,6 +391,24 @@ def run(args, model_loader=load_model) -> None:
             fold_results.append(result)
 
     if fold_results:
+        if args.convergence_pilot:
+            results = {
+                "config": vars(args),
+                "folds": fold_results,
+            }
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            results_path = output_dir / "cross_validation_results.json"
+            results_path.write_text(
+                json.dumps(results, indent=2),
+                encoding="utf-8",
+            )
+            print(
+                "\nPiloto completado. Curvas y recursos guardados en: "
+                f"{results_path}"
+            )
+            return
+
         summary = summarize_results(fold_results)
         results = {
             "config": vars(args),
