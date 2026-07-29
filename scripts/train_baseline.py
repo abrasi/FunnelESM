@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from transformers import (
-    AutoModelForSequenceClassification,
+    AutoConfig,
     AutoTokenizer,
     DataCollatorWithPadding,
     Trainer,
@@ -23,6 +23,15 @@ from zeus.monitor import ZeusMonitor
 
 from funnel_esm.data import DEEPLOC_LABELS, load_deeploc
 from funnel_esm.metrics import compute_metrics
+from funnel_esm.modeling_classification import (
+    MaskedAttentionEsmForSequenceClassification,
+)
+
+
+ROPE_KEY_MAPPING = {
+    "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
+        "esm.rotary_embeddings.inv_freq",
+}
 
 
 RESULT_NAMES = (
@@ -78,12 +87,18 @@ def parse_args():
 
 
 def load_model(args):
-    return AutoModelForSequenceClassification.from_pretrained(
+    config = AutoConfig.from_pretrained(args.model_name)
+    config.num_labels = len(DEEPLOC_LABELS)
+    config.problem_type = "multi_label_classification"
+    config.id2label = dict(enumerate(DEEPLOC_LABELS))
+    config.label2id = {
+        label: index for index, label in enumerate(DEEPLOC_LABELS)
+    }
+
+    return MaskedAttentionEsmForSequenceClassification.from_pretrained(
         args.model_name,
-        num_labels=len(DEEPLOC_LABELS),
-        problem_type="multi_label_classification",
-        id2label=dict(enumerate(DEEPLOC_LABELS)),
-        label2id={label: index for index, label in enumerate(DEEPLOC_LABELS)},
+        config=config,
+        key_mapping=ROPE_KEY_MAPPING,
     )
 
 

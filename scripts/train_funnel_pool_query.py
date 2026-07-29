@@ -7,14 +7,8 @@ from funnel_esm.data import DEEPLOC_LABELS
 from funnel_esm.modeling_funnel_esm import (
     FunnelEsmPoolQueryForSequenceClassification,
 )
-from train_baseline import build_parser, run
+from train_baseline import ROPE_KEY_MAPPING, build_parser, run
 from train_funnel import resolve_pool_after_layers
-
-
-ROPE_KEY_MAPPING = {
-    "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
-        "esm.rotary_embeddings.inv_freq",
-}
 
 
 def parse_args():
