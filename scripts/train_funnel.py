@@ -83,6 +83,9 @@ def load_funnel_model(args):
     config.funnel_pooling_type = "pairwise_masked_mean"
     config.num_labels = len(DEEPLOC_LABELS)
     config.problem_type = "multi_label_classification"
+    config.deeploc_focal_gamma = args.focal_gamma
+    config.deeploc_gaussian_kernel_size = 5
+    config.deeploc_gaussian_sigma = 2.0
     config.id2label = dict(enumerate(DEEPLOC_LABELS))
     config.label2id = {
         label: index for index, label in enumerate(DEEPLOC_LABELS)

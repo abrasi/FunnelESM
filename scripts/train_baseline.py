@@ -22,7 +22,13 @@ from transformers import (
 from zeus.monitor import ZeusMonitor
 
 from funnel_esm.data import DEEPLOC_LABELS, load_deeploc
-from funnel_esm.metrics import compute_metrics
+from funnel_esm.metrics import (
+    MCC_METRIC_NAMES,
+    build_compute_metrics,
+    inverse_frequency_label_weights,
+    optimize_mcc_thresholds,
+    sigmoid,
+)
 from funnel_esm.modeling_classification import (
     MaskedAttentionEsmForSequenceClassification,
 )
@@ -41,9 +47,17 @@ RESULT_NAMES = (
     "eval_jaccard",
     "eval_accuracy",
     "eval_num_labels_predicted",
+    "eval_macro_mcc",
+    *tuple(f"eval_{name}" for name in MCC_METRIC_NAMES),
     "train_gpu_energy_j",
     "train_gpu_energy_kwh",
     "train_time_s",
+    "threshold_calibration_gpu_energy_j",
+    "threshold_calibration_gpu_energy_kwh",
+    "threshold_calibration_time_s",
+    "pipeline_gpu_energy_j",
+    "pipeline_gpu_energy_kwh",
+    "pipeline_time_s",
     "peak_gpu_memory_gb",
 )
 
@@ -52,9 +66,21 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", required=True)
     parser.add_argument("--output_dir", default="outputs/baseline")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=1.0,
+        help="Focal-loss gamma. DeepLoc 2.0 uses 1.",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        choices=("no", "fp16", "bf16"),
+        default="fp16",
+        help="Precision shared by every architecture.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--model_name",
@@ -90,6 +116,11 @@ def load_model(args):
     config = AutoConfig.from_pretrained(args.model_name)
     config.num_labels = len(DEEPLOC_LABELS)
     config.problem_type = "multi_label_classification"
+    config.deeploc_focal_gamma = args.focal_gamma
+    config.deeploc_gaussian_kernel_size = 5
+    # Five samples spanning [-sigma, sigma], following DeepLoc's
+    # "size 5 clipped at one standard deviation" description.
+    config.deeploc_gaussian_sigma = 2.0
     config.id2label = dict(enumerate(DEEPLOC_LABELS))
     config.label2id = {
         label: index for index, label in enumerate(DEEPLOC_LABELS)
@@ -132,8 +163,14 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         tokenizer,
         validation_partition=fold,
     )
+    label_weights = inverse_frequency_label_weights(
+        datasets["train"]["labels"]
+    )
 
     model = model_loader(args)
+    model.set_label_weights(
+        torch.tensor(label_weights, dtype=torch.float32)
+    )
 
     for parameter in model.base_model.parameters():
         parameter.requires_grad = False
@@ -147,6 +184,8 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         eval_strategy="epoch" if args.eval_each_epoch else "no",
         logging_strategy="epoch" if args.eval_each_epoch else "no",
         save_strategy="no",
+        fp16=args.mixed_precision == "fp16",
+        bf16=args.mixed_precision == "bf16",
         report_to="none",
         seed=fold_seed,
         data_seed=fold_seed,
@@ -158,7 +197,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
         data_collator=DataCollatorWithPadding(tokenizer),
-        compute_metrics=compute_metrics,
+        compute_metrics=build_compute_metrics(),
         processing_class=tokenizer,
     )
 
@@ -197,12 +236,48 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         local_peak_memory_gb,
     )
 
+    trainer.compute_metrics = None
+    calibration_window_name = f"fold_{fold}_threshold_calibration"
+    monitor.begin_window(calibration_window_name)
+    calibration_output = trainer.predict(
+        datasets["train"],
+        metric_key_prefix="threshold_calibration",
+    )
+    thresholds = optimize_mcc_thresholds(
+        sigmoid(calibration_output.predictions),
+        calibration_output.label_ids,
+    )
+    calibration_measurement = monitor.end_window(
+        calibration_window_name
+    )
+    (
+        calibration_energy_j,
+        calibration_time_s,
+        _,
+    ) = aggregate_resources(
+        calibration_measurement.total_energy,
+        calibration_measurement.time,
+        0.0,
+    )
+
+    trainer.compute_metrics = build_compute_metrics(thresholds)
+    model.config.deeploc_thresholds = thresholds.tolist()
     metrics = trainer.evaluate()
     metrics.update(
         {
             "train_gpu_energy_j": energy_j,
             "train_gpu_energy_kwh": energy_j / 3_600_000,
             "train_time_s": time_s,
+            "threshold_calibration_gpu_energy_j":
+                calibration_energy_j,
+            "threshold_calibration_gpu_energy_kwh":
+                calibration_energy_j / 3_600_000,
+            "threshold_calibration_time_s": calibration_time_s,
+            "pipeline_gpu_energy_j":
+                energy_j + calibration_energy_j,
+            "pipeline_gpu_energy_kwh":
+                (energy_j + calibration_energy_j) / 3_600_000,
+            "pipeline_time_s": time_s + calibration_time_s,
             "peak_gpu_memory_gb": memory_gb,
         }
     )
@@ -216,6 +291,20 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         fold_result = {
             "fold": fold,
             "seed": fold_seed,
+            "thresholds": {
+                label: float(threshold)
+                for label, threshold in zip(
+                    DEEPLOC_LABELS,
+                    thresholds,
+                )
+            },
+            "label_weights": {
+                label: float(weight)
+                for label, weight in zip(
+                    DEEPLOC_LABELS,
+                    label_weights,
+                )
+            },
         }
         fold_result.update({name: float(metrics[name]) for name in RESULT_NAMES})
 

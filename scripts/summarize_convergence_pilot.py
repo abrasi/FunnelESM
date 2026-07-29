@@ -68,9 +68,9 @@ def main():
             row.update({key: record.get(key) for key in EVAL_KEYS})
             curve_rows.append(row)
 
-        best_record = max(
+        best_record = min(
             evaluation_records,
-            key=lambda record: record["eval_macro_f1"],
+            key=lambda record: record["eval_loss"],
         )
         final_results = json.loads(
             result_path.read_text(encoding="utf-8")
@@ -92,6 +92,18 @@ def main():
                     "train_gpu_energy_j"
                 ],
                 "train_time_s": final_results["train_time_s"],
+                "threshold_calibration_gpu_energy_j": final_results[
+                    "threshold_calibration_gpu_energy_j"
+                ],
+                "threshold_calibration_time_s": final_results[
+                    "threshold_calibration_time_s"
+                ],
+                "pipeline_gpu_energy_j": final_results[
+                    "pipeline_gpu_energy_j"
+                ],
+                "pipeline_time_s": final_results[
+                    "pipeline_time_s"
+                ],
                 "peak_gpu_memory_gb": final_results[
                     "peak_gpu_memory_gb"
                 ],
@@ -115,12 +127,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("\nBest macro-F1 by run")
+    print("\nBest validation loss by run")
     for result in run_summaries:
         print(
             f"{result['architecture']:24} "
             f"lr={result['learning_rate']:.3g} "
             f"epoch={result['best_epoch']:>4} "
+            f"loss={result['eval_loss']:.6f} "
             f"macro_f1={result['eval_macro_f1']:.6f}"
         )
 

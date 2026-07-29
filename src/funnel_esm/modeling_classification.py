@@ -15,12 +15,45 @@ from funnel_esm.pooling import MaskedAttentionClassificationHead
 class MaskedAttentionEsmForSequenceClassification(
     EsmForSequenceClassification
 ):
-    """ESM sequence classifier with residue-level attention pooling."""
+    """ESM classifier with DeepLoc-style pooling and weighted focal loss."""
 
     def __init__(self, config):
         super().__init__(config)
         self.classifier = MaskedAttentionClassificationHead(config)
         self.classifier.apply(self._init_weights)
+        self.focal_gamma = getattr(
+            config,
+            "deeploc_focal_gamma",
+            1.0,
+        )
+        if self.focal_gamma < 0:
+            raise ValueError("deeploc_focal_gamma cannot be negative")
+        label_weights = getattr(
+            config,
+            "deeploc_label_weights",
+            [1.0] * config.num_labels,
+        )
+        self.register_buffer(
+            "label_weights",
+            torch.tensor(label_weights, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def set_label_weights(self, label_weights: torch.Tensor) -> None:
+        """Set fold-specific inverse-frequency weights for the loss."""
+        if label_weights.shape != (self.config.num_labels,):
+            raise ValueError(
+                "label_weights must contain one value per label"
+            )
+        self.label_weights.copy_(
+            label_weights.to(
+                device=self.label_weights.device,
+                dtype=self.label_weights.dtype,
+            )
+        )
+        self.config.deeploc_label_weights = (
+            self.label_weights.detach().cpu().tolist()
+        )
 
     def forward(
         self,
@@ -71,10 +104,26 @@ class MaskedAttentionEsmForSequenceClassification(
         )
         loss = None
         if labels is not None:
-            loss = F.binary_cross_entropy_with_logits(
+            labels = labels.to(logits.dtype)
+            binary_cross_entropy = F.binary_cross_entropy_with_logits(
                 logits,
-                labels.to(logits.dtype),
+                labels,
+                reduction="none",
             )
+            probabilities = torch.sigmoid(logits)
+            target_probabilities = torch.where(
+                labels.bool(),
+                probabilities,
+                1 - probabilities,
+            )
+            focal_factor = (
+                1 - target_probabilities
+            ).pow(self.focal_gamma)
+            loss = (
+                binary_cross_entropy
+                * focal_factor
+                * self.label_weights.to(logits.dtype).unsqueeze(0)
+            ).mean()
 
         if not return_dict:
             output = (logits,) + outputs.to_tuple()[1:]

@@ -45,16 +45,21 @@ def build_parser():
     )
     parser.add_argument("--fold", type=int, choices=range(5), default=0)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument(
         "--base_learning_rate",
         type=float,
-        default=5e-4,
+        default=5e-5,
         help=(
             "Central learning rate. The pilot also uses LR/3 and 3*LR."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--mixed_precision",
+        choices=("no", "fp16", "bf16"),
+        default="fp16",
+    )
     parser.add_argument(
         "--model_name",
         default="facebook/esm2_t12_35M_UR50D",
@@ -128,6 +133,8 @@ def main():
                 str(learning_rate),
                 "--seed",
                 str(args.seed),
+                "--mixed_precision",
+                args.mixed_precision,
                 "--model_name",
                 args.model_name,
                 "--folds",
@@ -157,6 +164,7 @@ def main():
                 "fold": args.fold,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
+                "mixed_precision": args.mixed_precision,
                 "runs": runs,
             },
             indent=2,

@@ -8,16 +8,68 @@ from torch.nn import functional as F
 
 
 class MaskedAttentionPool(nn.Module):
-    """Learn one importance score per residue and take a weighted sum.
+    """DeepLoc-style attention pooling over valid residue representations.
 
-    Padding and the ESM ``<cls>``/``<eos>`` tokens do not participate in
-    the softmax. The input mask must therefore describe the current sequence
-    length, which can differ from the tokenizer mask after Funnel reductions.
+    A learnable vector scores each residue. The raw scores are smoothed with
+    the fixed five-position Gaussian filter described by DeepLoc 2.0 before
+    applying softmax. Padding and ESM special tokens do not participate.
     """
 
-    def __init__(self, hidden_size: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        gaussian_kernel_size: int = 5,
+        gaussian_sigma: float = 2.0,
+    ):
         super().__init__()
+        if gaussian_kernel_size != 5:
+            raise ValueError("DeepLoc attention pooling requires kernel size 5")
+        if gaussian_sigma <= 0:
+            raise ValueError("gaussian_sigma must be positive")
+
         self.score = nn.Linear(hidden_size, 1, bias=False)
+        offsets = torch.arange(
+            gaussian_kernel_size,
+            dtype=torch.float32,
+        )
+        offsets = offsets - gaussian_kernel_size // 2
+        kernel = torch.exp(
+            -0.5 * (offsets / gaussian_sigma).square()
+        )
+        kernel = kernel / kernel.sum()
+        self.register_buffer(
+            "gaussian_kernel",
+            kernel.view(1, 1, -1),
+            persistent=False,
+        )
+
+    def _smooth_scores(
+        self,
+        scores: torch.Tensor,
+        residue_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the Gaussian filter without mixing in invalid positions."""
+        kernel = self.gaussian_kernel.to(
+            device=scores.device,
+            dtype=scores.dtype,
+        )
+        mask = residue_mask.unsqueeze(1).to(scores.dtype)
+        padding = kernel.shape[-1] // 2
+
+        weighted_scores = F.conv1d(
+            scores.unsqueeze(1) * mask,
+            kernel,
+            padding=padding,
+        )
+        valid_weight = F.conv1d(
+            mask,
+            kernel,
+            padding=padding,
+        )
+        return (
+            weighted_scores
+            / valid_weight.clamp_min(torch.finfo(scores.dtype).eps)
+        ).squeeze(1)
 
     def forward(
         self,
@@ -43,12 +95,16 @@ class MaskedAttentionPool(nn.Module):
         )
         residue_mask[batch_indices, valid_lengths - 1] = False
 
-        scores = self.score(hidden_states).squeeze(-1)
-        scores = scores.masked_fill(
-            ~residue_mask,
-            torch.finfo(scores.dtype).min,
+        raw_scores = self.score(hidden_states).squeeze(-1)
+        smoothed_scores = self._smooth_scores(
+            raw_scores,
+            residue_mask,
         )
-        weights = torch.softmax(scores, dim=1)
+        smoothed_scores = smoothed_scores.masked_fill(
+            ~residue_mask,
+            torch.finfo(smoothed_scores.dtype).min,
+        )
+        weights = torch.softmax(smoothed_scores, dim=1)
 
         return torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
 
@@ -58,7 +114,19 @@ class MaskedAttentionClassificationHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.pool = MaskedAttentionPool(config.hidden_size)
+        self.pool = MaskedAttentionPool(
+            config.hidden_size,
+            gaussian_kernel_size=getattr(
+                config,
+                "deeploc_gaussian_kernel_size",
+                5,
+            ),
+            gaussian_sigma=getattr(
+                config,
+                "deeploc_gaussian_sigma",
+                2.0,
+            ),
+        )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
