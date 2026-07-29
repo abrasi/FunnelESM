@@ -1,10 +1,79 @@
-"""Sequence pooling operations used between ESM transformer layers."""
+"""Pooling operations used by the ESM classifiers."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+class MaskedAttentionPool(nn.Module):
+    """Learn one importance score per residue and take a weighted sum.
+
+    Padding and the ESM ``<cls>``/``<eos>`` tokens do not participate in
+    the softmax. The input mask must therefore describe the current sequence
+    length, which can differ from the tokenizer mask after Funnel reductions.
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.score = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.ndim != 3:
+            raise ValueError("hidden_states must have shape [B, L, D]")
+        if attention_mask.shape != hidden_states.shape[:2]:
+            raise ValueError("attention_mask and hidden_states are incompatible")
+
+        residue_mask = attention_mask.bool().clone()
+        valid_lengths = residue_mask.sum(dim=1)
+        if torch.any(valid_lengths < 3):
+            raise ValueError(
+                "each sequence must contain <cls>, a residue and <eos>"
+            )
+
+        residue_mask[:, 0] = False
+        batch_indices = torch.arange(
+            hidden_states.shape[0],
+            device=hidden_states.device,
+        )
+        residue_mask[batch_indices, valid_lengths - 1] = False
+
+        scores = self.score(hidden_states).squeeze(-1)
+        scores = scores.masked_fill(
+            ~residue_mask,
+            torch.finfo(scores.dtype).min,
+        )
+        weights = torch.softmax(scores, dim=1)
+
+        return torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
+
+
+class MaskedAttentionClassificationHead(nn.Module):
+    """Hugging Face ESM head with attention pooling instead of ``<cls>``."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.pool = MaskedAttentionPool(config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled = self.pool(hidden_states, attention_mask)
+        pooled = self.dropout(pooled)
+        pooled = self.dense(pooled)
+        pooled = torch.tanh(pooled)
+        pooled = self.dropout(pooled)
+        return self.out_proj(pooled)
 
 
 class MaskedMeanPool1d(nn.Module):

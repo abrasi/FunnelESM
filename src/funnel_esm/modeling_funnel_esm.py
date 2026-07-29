@@ -2,18 +2,31 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.esm.modeling_esm import (
-    EsmForSequenceClassification,
     EsmModel,
     eager_attention_forward,
 )
 
+from funnel_esm.modeling_classification import (
+    MaskedAttentionEsmForSequenceClassification,
+)
 from funnel_esm.pooling import MaskedMeanPool1d
+
+
+@dataclass
+class FunnelEsmModelOutput(
+    BaseModelOutputWithPoolingAndCrossAttentions
+):
+    """ESM output plus the mask matching the reduced hidden states."""
+
+    final_attention_mask: torch.Tensor | None = None
 
 
 class FunnelEsmModel(EsmModel):
@@ -179,13 +192,16 @@ class FunnelEsmModel(EsmModel):
             else None
         )
 
-        return BaseModelOutputWithPoolingAndCrossAttentions(
+        return FunnelEsmModelOutput(
             last_hidden_state=hidden_states,
             pooler_output=pooled_output,
+            final_attention_mask=attention_mask,
         )
 
 
-class FunnelEsmForSequenceClassification(EsmForSequenceClassification):
+class FunnelEsmForSequenceClassification(
+    MaskedAttentionEsmForSequenceClassification
+):
     """Sequence classifier using :class:`FunnelEsmModel` as its encoder."""
 
     def __init__(self, config):
@@ -440,14 +456,15 @@ class FunnelEsmPoolQueryModel(FunnelEsmModel):
             else None
         )
 
-        return BaseModelOutputWithPoolingAndCrossAttentions(
+        return FunnelEsmModelOutput(
             last_hidden_state=hidden_states,
             pooler_output=pooled_output,
+            final_attention_mask=attention_mask,
         )
 
 
 class FunnelEsmPoolQueryForSequenceClassification(
-    EsmForSequenceClassification
+    MaskedAttentionEsmForSequenceClassification
 ):
     """Sequence classifier with pool-query-only transitions."""
 
