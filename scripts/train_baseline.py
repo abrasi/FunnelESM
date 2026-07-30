@@ -78,7 +78,7 @@ def build_parser():
     parser.add_argument(
         "--mixed_precision",
         choices=("no", "fp16", "bf16"),
-        default="fp16",
+        default="bf16",
         help="Precision shared by every architecture.",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -112,6 +112,16 @@ def build_parser():
             "After collecting epoch curves, skip threshold calibration and "
             "final model saving. Intended for LR/epoch selection only."
         ),
+    )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        choices=("linear", "reduce_lr_on_plateau"),
+        default="linear",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
     )
     return parser
 
@@ -179,6 +189,24 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     model.set_label_weights(
         torch.tensor(label_weights, dtype=torch.float32)
     )
+    
+    if (
+        args.lr_scheduler_type == "reduce_lr_on_plateau"
+        and not args.eval_each_epoch
+    ):
+        raise ValueError(
+            "reduce_lr_on_plateau requires --eval_each_epoch"
+        )
+
+    scheduler_kwargs = {}
+
+    if args.lr_scheduler_type == "reduce_lr_on_plateau":
+        scheduler_kwargs = {
+            "mode": "min",
+            "factor": 0.1,
+            "patience": 1,
+            "min_lr": 1e-5,
+        }
 
     for parameter in model.base_model.parameters():
         parameter.requires_grad = False
@@ -192,6 +220,16 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         eval_strategy="epoch" if args.eval_each_epoch else "no",
         logging_strategy="epoch" if args.eval_each_epoch else "no",
         save_strategy="no",
+        optim="adamw_torch",
+        weight_decay=args.weight_decay,
+        lr_scheduler_type=args.lr_scheduler_type,
+        lr_scheduler_kwargs=scheduler_kwargs,
+        metric_for_best_model=(
+            "eval_loss"
+            if args.lr_scheduler_type == "reduce_lr_on_plateau"
+            else None
+        ),
+        greater_is_better=False,    
         fp16=args.mixed_precision == "fp16",
         bf16=args.mixed_precision == "bf16",
         report_to="none",

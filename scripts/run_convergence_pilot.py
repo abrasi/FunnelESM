@@ -30,7 +30,7 @@ EXPERIMENTS = (
     ),
 )
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 def build_parser():
@@ -186,6 +186,10 @@ def main():
                 str(args.seed),
                 "--mixed_precision",
                 args.mixed_precision,
+                "--lr_scheduler_type",
+                "reduce_lr_on_plateau",
+                "--weight_decay",
+                "0.01",
                 "--model_name",
                 args.model_name,
                 "--folds",
