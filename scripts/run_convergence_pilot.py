@@ -88,7 +88,7 @@ def build_parser():
     parser.add_argument(
         "--mixed_precision",
         choices=("no", "fp16", "bf16"),
-        default="fp16",
+        default="bf16",
     )
     parser.add_argument(
         "--model_name",
@@ -186,10 +186,6 @@ def main():
                 str(args.seed),
                 "--mixed_precision",
                 args.mixed_precision,
-                "--lr_scheduler_type",
-                "reduce_lr_on_plateau",
-                "--weight_decay",
-                "0.01",
                 "--model_name",
                 args.model_name,
                 "--folds",
@@ -211,7 +207,10 @@ def main():
 
     manifest = {
         "protocol_version": PROTOCOL_VERSION,
-        "purpose": "select_learning_rate_and_fixed_epochs",
+        "purpose": (
+            "select_one_common_learning_rate_and_verify_the_shared_"
+            "epoch_budget"
+        ),
         "selection_metric": "eval_loss",
         "dataset_path": str(Path(args.dataset_path).resolve()),
         "base_learning_rate": args.base_learning_rate,

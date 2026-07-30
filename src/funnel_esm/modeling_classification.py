@@ -15,7 +15,7 @@ from funnel_esm.pooling import MaskedAttentionClassificationHead
 class MaskedAttentionEsmForSequenceClassification(
     EsmForSequenceClassification
 ):
-    """ESM classifier with DeepLoc-style pooling and weighted focal loss."""
+    """ESM classifier with learned pooling and weighted focal loss."""
 
     def __init__(self, config):
         super().__init__(config)
@@ -105,25 +105,22 @@ class MaskedAttentionEsmForSequenceClassification(
         loss = None
         if labels is not None:
             labels = labels.to(logits.dtype)
-            binary_cross_entropy = F.binary_cross_entropy_with_logits(
+            unweighted_bce = F.binary_cross_entropy_with_logits(
                 logits,
                 labels,
                 reduction="none",
             )
-            probabilities = torch.sigmoid(logits)
-            target_probabilities = torch.where(
-                labels.bool(),
-                probabilities,
-                1 - probabilities,
+            weighted_bce = F.binary_cross_entropy_with_logits(
+                logits,
+                labels,
+                pos_weight=self.label_weights.to(logits.dtype),
+                reduction="none",
             )
+            target_probabilities = torch.exp(-unweighted_bce)
             focal_factor = (
-                1 - target_probabilities
+                1.0 - target_probabilities
             ).pow(self.focal_gamma)
-            loss = (
-                binary_cross_entropy
-                * focal_factor
-                * self.label_weights.to(logits.dtype).unsqueeze(0)
-            ).mean()
+            loss = (focal_factor * weighted_bce).mean()
 
         if not return_dict:
             output = (logits,) + outputs.to_tuple()[1:]

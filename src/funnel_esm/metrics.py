@@ -37,7 +37,7 @@ def sigmoid(logits):
 
 
 def inverse_frequency_label_weights(labels):
-    """Compute normalized inverse-frequency weights from training labels."""
+    """Compute positive-label weights from training-fold frequencies."""
     labels = np.asarray(labels, dtype=np.float64)
     if labels.ndim != 2:
         raise ValueError("labels must have shape [N, num_labels]")
@@ -46,8 +46,7 @@ def inverse_frequency_label_weights(labels):
     if np.any(counts <= 0):
         raise ValueError("each label must occur in the training split")
 
-    weights = 1 / counts
-    return weights / weights.mean()
+    return counts.max() / counts
 
 
 def optimize_mcc_thresholds(probabilities, labels):

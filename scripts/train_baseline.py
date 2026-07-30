@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.metadata
 import json
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,16 @@ from funnel_esm.metrics import (
 from funnel_esm.modeling_classification import (
     MaskedAttentionEsmForSequenceClassification,
 )
+
+
+def package_version(*distribution_names):
+    """Return the installed version for the first matching distribution."""
+    for distribution_name in distribution_names:
+        try:
+            return importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "unknown"
 
 
 ROPE_KEY_MAPPING = {
@@ -113,16 +125,6 @@ def build_parser():
             "final model saving. Intended for LR/epoch selection only."
         ),
     )
-    parser.add_argument(
-        "--lr_scheduler_type",
-        choices=("linear", "reduce_lr_on_plateau"),
-        default="linear",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.0,
-    )
     return parser
 
 
@@ -135,10 +137,6 @@ def load_model(args):
     config.num_labels = len(DEEPLOC_LABELS)
     config.problem_type = "multi_label_classification"
     config.deeploc_focal_gamma = args.focal_gamma
-    config.deeploc_gaussian_kernel_size = 5
-    # Five samples spanning [-sigma, sigma], following DeepLoc's
-    # "size 5 clipped at one standard deviation" description.
-    config.deeploc_gaussian_sigma = 2.0
     config.id2label = dict(enumerate(DEEPLOC_LABELS))
     config.label2id = {
         label: index for index, label in enumerate(DEEPLOC_LABELS)
@@ -189,24 +187,6 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     model.set_label_weights(
         torch.tensor(label_weights, dtype=torch.float32)
     )
-    
-    if (
-        args.lr_scheduler_type == "reduce_lr_on_plateau"
-        and not args.eval_each_epoch
-    ):
-        raise ValueError(
-            "reduce_lr_on_plateau requires --eval_each_epoch"
-        )
-
-    scheduler_kwargs = {}
-
-    if args.lr_scheduler_type == "reduce_lr_on_plateau":
-        scheduler_kwargs = {
-            "mode": "min",
-            "factor": 0.1,
-            "patience": 1,
-            "min_lr": 1e-5,
-        }
 
     for parameter in model.base_model.parameters():
         parameter.requires_grad = False
@@ -220,16 +200,6 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         eval_strategy="epoch" if args.eval_each_epoch else "no",
         logging_strategy="epoch" if args.eval_each_epoch else "no",
         save_strategy="no",
-        optim="adamw_torch",
-        weight_decay=args.weight_decay,
-        lr_scheduler_type=args.lr_scheduler_type,
-        lr_scheduler_kwargs=scheduler_kwargs,
-        metric_for_best_model=(
-            "eval_loss"
-            if args.lr_scheduler_type == "reduce_lr_on_plateau"
-            else None
-        ),
-        greater_is_better=False,    
         fp16=args.mixed_precision == "fp16",
         bf16=args.mixed_precision == "bf16",
         report_to="none",
@@ -246,6 +216,41 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         compute_metrics=build_compute_metrics(),
         processing_class=tokenizer,
     )
+
+    if trainer.is_world_process_zero():
+        world_size = (
+            dist.get_world_size()
+            if dist.is_initialized()
+            else 1
+        )
+        protocol = {
+            "training_arguments": training_args.to_dict(),
+            "effective_train_batch_size": (
+                training_args.per_device_train_batch_size
+                * training_args.gradient_accumulation_steps
+                * world_size
+            ),
+            "runtime": {
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "transformers": package_version("transformers"),
+                "accelerate": package_version("accelerate"),
+                "datasets": package_version("datasets"),
+                "zeus": package_version("zeus", "zeus-ml"),
+                "cuda_runtime": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version(),
+                "gpu": torch.cuda.get_device_name(
+                    torch.cuda.current_device()
+                ),
+                "world_size": world_size,
+            },
+        }
+        protocol_path = fold_output_dir / "training_protocol.json"
+        protocol_path.parent.mkdir(parents=True, exist_ok=True)
+        protocol_path.write_text(
+            json.dumps(protocol, indent=2),
+            encoding="utf-8",
+        )
 
     if dist.is_initialized():
         monitored_gpus = [torch.cuda.current_device()]
@@ -418,6 +423,14 @@ def run(args, model_loader=load_model) -> None:
         )
     if not torch.cuda.is_available():
         raise RuntimeError("Este script requiere al menos una GPU CUDA.")
+    if (
+        args.mixed_precision == "bf16"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise RuntimeError(
+            "La GPU no soporta BF16. Usa --mixed_precision no para "
+            "ejecutar en FP32; no cambies automáticamente a FP16."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     fold_results = []
