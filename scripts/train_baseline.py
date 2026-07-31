@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import importlib.metadata
 import json
@@ -26,8 +27,10 @@ from zeus.monitor import ZeusMonitor
 from funnel_esm.data import DEEPLOC_LABELS, load_deeploc
 from funnel_esm.metrics import (
     MCC_METRIC_NAMES,
+    apply_thresholds,
     build_compute_metrics,
     inverse_frequency_label_weights,
+    label_metric_name,
     optimize_mcc_thresholds,
     sigmoid,
 )
@@ -80,7 +83,12 @@ def build_parser():
     parser.add_argument("--output_dir", default="outputs/baseline")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate fixed from the fold-0 convergence pilot.",
+    )
     parser.add_argument(
         "--focal_gamma",
         type=float,
@@ -113,8 +121,8 @@ def build_parser():
         "--eval_each_epoch",
         action="store_true",
         help=(
-            "Evaluate after every epoch and save the resulting learning "
-            "curve. Intended for convergence pilots."
+            "Compatibility flag used by the convergence pilot. Final "
+            "training always evaluates and records every epoch."
         ),
     )
     parser.add_argument(
@@ -123,6 +131,14 @@ def build_parser():
         help=(
             "After collecting epoch curves, skip threshold calibration and "
             "final model saving. Intended for LR/epoch selection only."
+        ),
+    )
+    parser.add_argument(
+        "--skip_existing_folds",
+        action="store_true",
+        help=(
+            "Reuse completed fold_result.json files. Intended for "
+            "recovering an interrupted final experiment."
         ),
     )
     return parser
@@ -168,16 +184,76 @@ def aggregate_resources(energy_j, time_s, memory_gb):
     return energy.item(), run_time.item(), memory.item()
 
 
+def save_fold_predictions(
+    output_path,
+    protein_ids,
+    probabilities,
+    labels,
+    predictions,
+):
+    """Save fold-level outputs required for paired statistical analyses."""
+    probabilities = np.asarray(probabilities)
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    expected_shape = (len(protein_ids), len(DEEPLOC_LABELS))
+    if probabilities.shape != expected_shape:
+        raise ValueError("probabilities do not match protein identifiers")
+    if labels.shape != expected_shape or predictions.shape != expected_shape:
+        raise ValueError("labels and predictions must match probabilities")
+
+    label_names = [label_metric_name(label) for label in DEEPLOC_LABELS]
+    fieldnames = ["protein_id"]
+    fieldnames.extend(f"prob_{name}" for name in label_names)
+    fieldnames.extend(f"true_{name}" for name in label_names)
+    fieldnames.extend(f"pred_{name}" for name in label_names)
+
+    with Path(output_path).open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row_index, protein_id in enumerate(protein_ids):
+            row = {"protein_id": protein_id}
+            row.update(
+                {
+                    f"prob_{name}": float(probabilities[row_index, index])
+                    for index, name in enumerate(label_names)
+                }
+            )
+            row.update(
+                {
+                    f"true_{name}": int(labels[row_index, index])
+                    for index, name in enumerate(label_names)
+                }
+            )
+            row.update(
+                {
+                    f"pred_{name}": int(predictions[row_index, index])
+                    for index, name in enumerate(label_names)
+                }
+            )
+            writer.writerow(row)
+
+
+def model_input_dataset(dataset):
+    """Remove analysis-only identifiers before Hugging Face collation."""
+    if "protein_id" in dataset.column_names:
+        return dataset.remove_columns("protein_id")
+    return dataset
+
+
 def train_fold(args, tokenizer, fold, model_loader=load_model):
     """Train one fold and return its metrics on the main process."""
     fold_seed = args.seed + fold
     set_seed(fold_seed)
     fold_output_dir = Path(args.output_dir) / f"fold_{fold}"
+    final_experiment = not args.convergence_pilot
 
     datasets = load_deeploc(
         args.dataset_path,
         tokenizer,
         validation_partition=fold,
+        use_internal_validation=final_experiment,
+        internal_validation_size=2048,
+        internal_validation_seed=0,
     )
     label_weights = inverse_frequency_label_weights(
         datasets["train"]["labels"]
@@ -197,9 +273,13 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        eval_strategy="epoch" if args.eval_each_epoch else "no",
-        logging_strategy="epoch" if args.eval_each_epoch else "no",
-        save_strategy="no",
+        eval_strategy="epoch",
+        logging_strategy="epoch",
+        save_strategy="epoch" if final_experiment else "no",
+        load_best_model_at_end=final_experiment,
+        metric_for_best_model="eval_loss" if final_experiment else None,
+        greater_is_better=False if final_experiment else None,
+        save_total_limit=1 if final_experiment else None,
         fp16=args.mixed_precision == "fp16",
         bf16=args.mixed_precision == "bf16",
         report_to="none",
@@ -210,10 +290,13 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=datasets["train"],
-        eval_dataset=datasets["validation"],
+        train_dataset=model_input_dataset(datasets["train"]),
+        eval_dataset=model_input_dataset(datasets["validation"]),
         data_collator=DataCollatorWithPadding(tokenizer),
-        compute_metrics=build_compute_metrics(),
+        compute_metrics=build_compute_metrics(
+            force_at_least_one=not final_experiment,
+            inclusive=not final_experiment,
+        ),
         processing_class=tokenizer,
     )
 
@@ -245,6 +328,17 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
                 "world_size": world_size,
             },
         }
+        if final_experiment:
+            protocol["data_protocol"] = {
+                "outer_evaluation_partition": fold,
+                "internal_validation_size": 2048,
+                "internal_validation_seed": 0,
+                "checkpoint_selection_data": "internal_validation",
+                "threshold_calibration_data": (
+                    "four_official_outer_training_partitions"
+                ),
+                "outer_evaluation_labels_used_before_evaluation": False,
+            }
         protocol_path = fold_output_dir / "training_protocol.json"
         protocol_path.parent.mkdir(parents=True, exist_ok=True)
         protocol_path.write_text(
@@ -269,7 +363,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     trainer.train()
     measurement = monitor.end_window(window_name)
 
-    if trainer.is_world_process_zero() and args.eval_each_epoch:
+    if trainer.is_world_process_zero():
         history_path = fold_output_dir / "epoch_history.json"
         history_path.write_text(
             json.dumps(trainer.state.log_history, indent=2),
@@ -307,11 +401,28 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         torch.cuda.empty_cache()
         return fold_result
 
+    if trainer.state.best_model_checkpoint is None:
+        raise RuntimeError(
+            "Final training finished without selecting a best checkpoint."
+        )
+
+    evaluation_records = [
+        record
+        for record in trainer.state.log_history
+        if "eval_loss" in record
+    ]
+    if not evaluation_records:
+        raise RuntimeError("No epoch-level validation losses were recorded.")
+    best_record = min(
+        evaluation_records,
+        key=lambda record: record["eval_loss"],
+    )
+
     trainer.compute_metrics = None
     calibration_window_name = f"fold_{fold}_threshold_calibration"
     monitor.begin_window(calibration_window_name)
     calibration_output = trainer.predict(
-        datasets["train"],
+        model_input_dataset(datasets["threshold_calibration"]),
         metric_key_prefix="threshold_calibration",
     )
     thresholds = optimize_mcc_thresholds(
@@ -331,9 +442,26 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         0.0,
     )
 
-    trainer.compute_metrics = build_compute_metrics(thresholds)
+    trainer.compute_metrics = build_compute_metrics(
+        thresholds,
+        force_at_least_one=False,
+        inclusive=False,
+    )
     model.config.deeploc_thresholds = thresholds.tolist()
-    metrics = trainer.evaluate()
+    model.config.deeploc_force_at_least_one_label = False
+    model.config.deeploc_threshold_comparison = ">"
+    evaluation_output = trainer.predict(
+        model_input_dataset(datasets["outer_validation"]),
+        metric_key_prefix="eval",
+    )
+    metrics = evaluation_output.metrics
+    evaluation_probabilities = sigmoid(evaluation_output.predictions)
+    evaluation_predictions = apply_thresholds(
+        evaluation_probabilities,
+        thresholds,
+        force_at_least_one=False,
+        inclusive=False,
+    )
     metrics.update(
         {
             "train_gpu_energy_j": energy_j,
@@ -362,6 +490,28 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         fold_result = {
             "fold": fold,
             "seed": fold_seed,
+            "model_selection": {
+                "metric": "eval_loss",
+                "data": (
+                    "fixed_2048_internal_validation_examples_from_the_"
+                    "four_outer_training_partitions"
+                ),
+                "internal_validation_seed": 0,
+                "best_metric": float(trainer.state.best_metric),
+                "best_epoch": float(best_record["epoch"]),
+                "best_model_checkpoint": (
+                    trainer.state.best_model_checkpoint
+                ),
+                "maximum_epochs": args.epochs,
+                "early_stopping": False,
+            },
+            "threshold_calibration": {
+                "metric": "per_label_mcc",
+                "data": "four_official_training_partitions",
+                "evaluated_partition_labels_used": False,
+                "force_at_least_one_label": False,
+                "threshold_comparison": "probability > threshold",
+            },
             "thresholds": {
                 label: float(threshold)
                 for label, threshold in zip(
@@ -378,6 +528,18 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
             },
         }
         fold_result.update({name: float(metrics[name]) for name in RESULT_NAMES})
+        save_fold_predictions(
+            fold_output_dir / "outer_fold_predictions.csv",
+            datasets["outer_validation"]["protein_id"],
+            evaluation_probabilities,
+            evaluation_output.label_ids,
+            evaluation_predictions,
+        )
+        fold_result_path = fold_output_dir / "fold_result.json"
+        fold_result_path.write_text(
+            json.dumps(fold_result, indent=2),
+            encoding="utf-8",
+        )
 
     if dist.is_initialized():
         dist.barrier()
@@ -396,7 +558,7 @@ def summarize_results(fold_results):
         summary[name] = {
             "mean": float(np.mean(values)),
             "std": (
-                float(np.std(values, ddof=1))
+                float(np.std(values, ddof=0))
                 if len(values) > 1
                 else None
             ),
@@ -437,7 +599,25 @@ def run(args, model_loader=load_model) -> None:
     folds = args.folds if args.folds is not None else range(5)
 
     for fold in folds:
-        result = train_fold(args, tokenizer, fold, model_loader)
+        fold_result_path = (
+            Path(args.output_dir) / f"fold_{fold}" / "fold_result.json"
+        )
+        if (
+            args.skip_existing_folds
+            and not args.convergence_pilot
+            and fold_result_path.exists()
+        ):
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"Reusing completed fold {fold}: {fold_result_path}")
+                result = json.loads(
+                    fold_result_path.read_text(encoding="utf-8")
+                )
+            else:
+                result = None
+            if dist.is_initialized():
+                dist.barrier()
+        else:
+            result = train_fold(args, tokenizer, fold, model_loader)
         if result is not None:
             fold_results.append(result)
 

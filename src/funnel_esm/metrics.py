@@ -106,6 +106,7 @@ def apply_thresholds(
     probabilities,
     thresholds,
     force_at_least_one=True,
+    inclusive=True,
 ):
     """Convert probabilities to labels using DeepLoc-style thresholds."""
     probabilities = np.asarray(probabilities)
@@ -113,7 +114,10 @@ def apply_thresholds(
     if thresholds.shape != (probabilities.shape[1],):
         raise ValueError("thresholds must contain one value per label")
 
-    predictions = (probabilities >= thresholds).astype(np.int64)
+    if inclusive:
+        predictions = (probabilities >= thresholds).astype(np.int64)
+    else:
+        predictions = (probabilities > thresholds).astype(np.int64)
     if force_at_least_one:
         empty_rows = predictions.sum(axis=1) == 0
         if np.any(empty_rows):
@@ -126,13 +130,20 @@ def apply_thresholds(
     return predictions
 
 
-def multilabel_metrics(labels, probabilities, thresholds):
+def multilabel_metrics(
+    labels,
+    probabilities,
+    thresholds,
+    force_at_least_one=True,
+    inclusive=True,
+):
     """Compute the metrics reported for DeepLoc 2.0."""
     labels = np.asarray(labels, dtype=np.int64)
     predictions = apply_thresholds(
         probabilities,
         thresholds,
-        force_at_least_one=True,
+        force_at_least_one=force_at_least_one,
+        inclusive=inclusive,
     )
 
     metrics = {
@@ -174,7 +185,11 @@ def multilabel_metrics(labels, probabilities, thresholds):
     return metrics
 
 
-def build_compute_metrics(thresholds=None):
+def build_compute_metrics(
+    thresholds=None,
+    force_at_least_one=True,
+    inclusive=True,
+):
     """Create a Hugging Face ``compute_metrics`` callback."""
     if thresholds is None:
         thresholds = np.full(len(DEEPLOC_LABELS), 0.5)
@@ -186,6 +201,8 @@ def build_compute_metrics(thresholds=None):
             eval_prediction.label_ids,
             probabilities,
             thresholds,
+            force_at_least_one=force_at_least_one,
+            inclusive=inclusive,
         )
 
     return compute_metrics
