@@ -44,6 +44,11 @@ ARCHITECTURE_MODEL_CLASSES = {
     "pool_query_layers_4_8": FunnelEsmPoolQueryForSequenceClassification,
 }
 
+ROPE_KEY_MAPPING = {
+    "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
+        "esm.rotary_embeddings.inv_freq",
+}
+
 # DeepLoc 2.0 Table 2 evaluates six HPA locations. The downloaded HPA file
 # also contains Lysosome/Vacuole and Peroxisome, but with only 2 and 7
 # positive examples, respectively; they are excluded from the benchmark.
@@ -97,17 +102,23 @@ def build_parser():
             "directory if the HPA protocol changes."
         ),
     )
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help=(
+            "Must match the final experiment manifest. If omitted, it is "
+            "read from that manifest."
+        ),
+    )
     parser.add_argument(
         "--mixed_precision",
         choices=("no", "fp16", "bf16"),
-        default="bf16",
-    )
-    parser.add_argument(
-        "--architectures",
-        nargs="+",
-        choices=tuple(ARCHITECTURE_MODEL_CLASSES),
         default=None,
+        help=(
+            "Must match the final experiment manifest. If omitted, it is "
+            "read from that manifest."
+        ),
     )
     return parser
 
@@ -236,7 +247,10 @@ def evaluate_architecture(
 
         thresholds_10 = load_thresholds(fold_result_path)
         thresholds = thresholds_10[list(HPA_OUTPUT_INDICES)]
-        model = model_class.from_pretrained(model_dir)
+        model = model_class.from_pretrained(
+            model_dir,
+            key_mapping=ROPE_KEY_MAPPING,
+        )
         config_thresholds = getattr(
             model.config,
             "deeploc_thresholds",
@@ -260,6 +274,12 @@ def evaluate_architecture(
             bf16=args.mixed_precision == "bf16",
             report_to="none",
         )
+        if prediction_args.n_gpu != 1:
+            raise RuntimeError(
+                "HPA evaluation must use exactly one GPU. Launch it with "
+                "torchrun --standalone --nproc_per_node=1, as in the "
+                "training experiments."
+            )
         trainer = Trainer(
             model=model,
             args=prediction_args,
@@ -308,6 +328,9 @@ def evaluate_architecture(
                     torch.cuda.max_memory_allocated(gpu_index)
                     / 1_000_000_000
                 ),
+                "gpu_index": gpu_index,
+                "gpu_name": torch.cuda.get_device_name(gpu_index),
+                "trainer_n_gpu": prediction_args.n_gpu,
                 "thresholds": {
                     label: float(threshold)
                     for label, threshold in zip(
@@ -422,23 +445,16 @@ def evaluate_architecture(
 
 def main():
     args = build_parser().parse_args()
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    launched_with_torchrun = "LOCAL_RANK" in os.environ
+    if not launched_with_torchrun or world_size != 1:
         raise RuntimeError(
-            "Run evaluate_hpa.py with python, not torchrun. HPA resource "
-            "measurements and output files are defined for one GPU."
+            "evaluate_hpa.py is the single-GPU worker. Launch it through "
+            "run_hpa_evaluation.py so it uses exactly one torchrun "
+            "process, like the final training experiments."
         )
-    if args.batch_size < 1:
-        raise ValueError("--batch_size must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("HPA evaluation requires a CUDA GPU.")
-    if (
-        args.mixed_precision == "bf16"
-        and not torch.cuda.is_bf16_supported()
-    ):
-        raise RuntimeError(
-            "The GPU does not support BF16. Use --mixed_precision no "
-            "for FP32; do not silently switch to FP16."
-        )
 
     final_output_dir = Path(args.final_output_dir).resolve()
     final_manifest_path = (
@@ -451,25 +467,118 @@ def main():
     final_manifest = json.loads(
         final_manifest_path.read_text(encoding="utf-8")
     )
-    model_name = final_manifest["model_name"]
-    architectures = (
-        args.architectures
-        if args.architectures is not None
-        else list(ARCHITECTURE_MODEL_CLASSES)
-    )
+    if final_manifest.get("protocol_version") != 2:
+        raise RuntimeError(
+            "The final results were not produced by protocol version 2."
+        )
+    if final_manifest.get("nproc_per_node") != 1:
+        raise RuntimeError(
+            "HPA single-GPU resources are only comparable with final "
+            "experiments produced using nproc_per_node=1."
+        )
 
+    final_batch_size = int(final_manifest["batch_size_per_device"])
+    if args.batch_size is not None and args.batch_size != final_batch_size:
+        raise RuntimeError(
+            "--batch_size must match the final experiment manifest: "
+            f"{final_batch_size}."
+        )
+    args.batch_size = final_batch_size
+
+    final_mixed_precision = final_manifest["mixed_precision"]
+    if (
+        args.mixed_precision is not None
+        and args.mixed_precision != final_mixed_precision
+    ):
+        raise RuntimeError(
+            "--mixed_precision must match the final experiment manifest: "
+            f"{final_mixed_precision}."
+        )
+    args.mixed_precision = final_mixed_precision
+    if (
+        args.mixed_precision == "bf16"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise RuntimeError(
+            "The final protocol uses BF16, but this GPU does not support "
+            "it. Use the same compatible GPU as for training."
+        )
+
+    model_name = final_manifest["model_name"]
+    manifest_architectures = [
+        run["name"] for run in final_manifest.get("runs", [])
+    ]
+    if manifest_architectures != list(ARCHITECTURE_MODEL_CLASSES):
+        raise RuntimeError(
+            "The final manifest does not contain the five expected "
+            "architectures in their fixed order."
+        )
+    architectures = manifest_architectures
+
+    training_gpu_names = set()
     for architecture in architectures:
         for fold in range(5):
-            fold_result_path = (
+            fold_dir = (
                 final_output_dir
                 / architecture
                 / f"fold_{fold}"
-                / "fold_result.json"
             )
+            fold_result_path = fold_dir / "fold_result.json"
             if not fold_result_path.exists():
                 raise FileNotFoundError(
                     f"Missing completed fold: {fold_result_path}"
                 )
+            fold_result = json.loads(
+                fold_result_path.read_text(encoding="utf-8")
+            )
+            if fold_result.get("fold") != fold:
+                raise RuntimeError(
+                    f"Fold identity mismatch in {fold_result_path}"
+                )
+
+            training_protocol_path = (
+                fold_dir / "training_protocol.json"
+            )
+            if not training_protocol_path.exists():
+                raise FileNotFoundError(
+                    "Missing training protocol: "
+                    f"{training_protocol_path}"
+                )
+            training_protocol = json.loads(
+                training_protocol_path.read_text(encoding="utf-8")
+            )
+            training_arguments = training_protocol[
+                "training_arguments"
+            ]
+            if (
+                training_arguments["per_device_eval_batch_size"]
+                != args.batch_size
+                or bool(training_arguments["fp16"])
+                != (args.mixed_precision == "fp16")
+                or bool(training_arguments["bf16"])
+                != (args.mixed_precision == "bf16")
+            ):
+                raise RuntimeError(
+                    "Fold evaluation settings do not match the final "
+                    f"manifest: {training_protocol_path}"
+                )
+            training_gpu_names.add(
+                training_protocol["runtime"]["gpu"]
+            )
+
+    if len(training_gpu_names) != 1:
+        raise RuntimeError(
+            "The final folds were not run on one consistent GPU model."
+        )
+    current_gpu_name = torch.cuda.get_device_name(
+        torch.cuda.current_device()
+    )
+    if current_gpu_name not in training_gpu_names:
+        raise RuntimeError(
+            "HPA must use the same GPU model as the final experiments. "
+            f"Training used {next(iter(training_gpu_names))!r}, but HPA "
+            f"would use {current_gpu_name!r}."
+        )
 
     hpa_path = Path(args.hpa_path).resolve()
     output_root = (
@@ -523,6 +632,18 @@ def main():
             "mean fold probability compared with mean fold threshold"
         ),
         "inference_resources_exclude_model_loading": True,
+        "runtime": {
+            "launcher": (
+                "torchrun" if launched_with_torchrun else "python"
+            ),
+            "world_size": world_size,
+            "visible_cuda_devices": torch.cuda.device_count(),
+            "used_cuda_device": torch.cuda.current_device(),
+            "gpu_name": torch.cuda.get_device_name(
+                torch.cuda.current_device()
+            ),
+            "inference_gpu_count": 1,
+        },
     }
     (output_root / "hpa_evaluation_manifest.json").write_text(
         json.dumps(manifest, indent=2),
