@@ -57,7 +57,7 @@ def load_deeploc(
     this option disabled and retain their original behavior.
     """
 
-    dataset = load_dataset("csv", data_files=csv_path, split="train")
+    dataset = load_dataset("csv", data_files=str(csv_path), split="train")
     if use_internal_validation:
         dataset = dataset.map(
             lambda _example, index: {"_source_row": index},
@@ -158,7 +158,7 @@ def load_hpa(csv_path, tokenizer, max_residues=1022):
     labels. Labels and identifiers remain in the returned dataset for
     analysis and must be removed before passing examples to the model.
     """
-    dataset = load_dataset("csv", data_files=csv_path, split="train")
+    dataset = load_dataset("csv", data_files=str(csv_path), split="train")
     required_columns = {"sid", "fasta", *HPA_LABELS}
     missing_columns = required_columns.difference(dataset.column_names)
     if missing_columns:
