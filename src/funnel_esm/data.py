@@ -17,6 +17,23 @@ DEEPLOC_LABELS = (
     "Peroxisome",
 )
 
+# The independent HPA benchmark does not annotate Extracellular or Plastid.
+# Keep the remaining labels in the same order as the ten-output classifier.
+HPA_LABELS = tuple(
+    label
+    for label in DEEPLOC_LABELS
+    if label not in {"Extracellular", "Plastid"}
+)
+
+
+def truncate_protein_middle(sequence, max_residues):
+    """Keep both termini when a protein exceeds the ESM-2 limit."""
+    if len(sequence) <= max_residues:
+        return sequence
+    left_residues = max_residues // 2
+    right_residues = max_residues - left_residues
+    return sequence[:left_residues] + sequence[-right_residues:]
+
 
 def load_deeploc(
     csv_path,
@@ -96,17 +113,8 @@ def load_deeploc(
         )
 
     def tokenize(batch):
-        left_residues = max_residues // 2
-        right_residues = max_residues - left_residues
         sequences = [
-            (
-                sequence
-                if len(sequence) <= max_residues
-                else (
-                    sequence[:left_residues]
-                    + sequence[-right_residues:]
-                )
-            )
+            truncate_protein_middle(sequence, max_residues)
             for sequence in batch["Sequence"]
         ]
 
@@ -137,6 +145,42 @@ def load_deeploc(
         datasets["outer_validation"] = outer_validation_dataset
 
     return DatasetDict(datasets).map(
+        tokenize,
+        batched=True,
+        remove_columns=dataset.column_names,
+    )
+
+
+def load_hpa(csv_path, tokenizer, max_residues=1022):
+    """Load the untouched DeepLoc 2.0 HPA independent test set.
+
+    HPA contains ground truth for eight of the classifier's ten output
+    labels. Labels and identifiers remain in the returned dataset for
+    analysis and must be removed before passing examples to the model.
+    """
+    dataset = load_dataset("csv", data_files=csv_path, split="train")
+    required_columns = {"sid", "fasta", *HPA_LABELS}
+    missing_columns = required_columns.difference(dataset.column_names)
+    if missing_columns:
+        raise ValueError(
+            "HPA dataset is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    def tokenize(batch):
+        sequences = [
+            truncate_protein_middle(sequence, max_residues)
+            for sequence in batch["fasta"]
+        ]
+        encoded = tokenizer(sequences, truncation=False)
+        encoded["protein_id"] = [str(identifier) for identifier in batch["sid"]]
+        encoded["hpa_labels"] = [
+            [float(batch[label][index]) for label in HPA_LABELS]
+            for index in range(len(sequences))
+        ]
+        return encoded
+
+    return dataset.map(
         tokenize,
         batched=True,
         remove_columns=dataset.column_names,

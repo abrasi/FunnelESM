@@ -136,9 +136,15 @@ def multilabel_metrics(
     thresholds,
     force_at_least_one=True,
     inclusive=True,
+    label_names=DEEPLOC_LABELS,
 ):
     """Compute the metrics reported for DeepLoc 2.0."""
     labels = np.asarray(labels, dtype=np.int64)
+    label_names = tuple(label_names)
+    if labels.ndim != 2 or labels.shape[1] != len(label_names):
+        raise ValueError(
+            "labels must contain one column for every label name"
+        )
     predictions = apply_thresholds(
         probabilities,
         thresholds,
@@ -174,7 +180,8 @@ def multilabel_metrics(
     }
 
     per_label_mcc = []
-    for label_index, metric_name in enumerate(MCC_METRIC_NAMES):
+    for label_index, label in enumerate(label_names):
+        metric_name = f"mcc_{label_metric_name(label)}"
         mcc = matthews_corrcoef(
             labels[:, label_index],
             predictions[:, label_index],
