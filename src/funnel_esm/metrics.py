@@ -11,7 +11,7 @@ from sklearn.metrics import (
     matthews_corrcoef,
 )
 
-from funnel_esm.data import DEEPLOC_LABELS
+from funnel_esm.deeploc import DEEPLOC_LABELS
 
 
 def label_metric_name(label: str) -> str:

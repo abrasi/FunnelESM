@@ -20,7 +20,7 @@ from transformers import (
 )
 from zeus.monitor import ZeusMonitor
 
-from funnel_esm.data import DEEPLOC_LABELS, HPA_LABELS, load_hpa
+from funnel_esm.deeploc import DEEPLOC_LABELS, HPA_LABELS, load_hpa
 from funnel_esm.metrics import (
     apply_thresholds,
     label_metric_name,

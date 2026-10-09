@@ -24,7 +24,7 @@ from transformers import (
 )
 from zeus.monitor import ZeusMonitor
 
-from funnel_esm.data import DEEPLOC_LABELS, load_deeploc
+from funnel_esm.deeploc import DEEPLOC_LABELS, load_deeploc
 from funnel_esm.metrics import (
     MCC_METRIC_NAMES,
     apply_thresholds,

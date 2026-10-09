@@ -3,7 +3,7 @@
 
 from transformers import AutoConfig
 
-from funnel_esm.data import DEEPLOC_LABELS
+from funnel_esm.deeploc import DEEPLOC_LABELS
 from funnel_esm.modeling_funnel_esm import (
     FunnelEsmForSequenceClassification,
 )
