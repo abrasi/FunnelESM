@@ -22,7 +22,7 @@ def _normalize_sequence(value):
 
 
 def _read_protein_ec_csv(csv_path):
-    frame = pd.read_csv(csv_path, dtype={"EC number": str})
+    frame = pd.read_csv(csv_path, dtype={"EC number": str}, sep="\t")
     required = {"Sequence", "EC number"}
     missing = required.difference(frame.columns)
     if missing:
