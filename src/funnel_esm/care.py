@@ -108,7 +108,7 @@ def load_care(
     max_residues=1022,
     cluster_metadata_csv=None,
 ):
-    """Return CARE train/validation, calibration, and optional official test.
+    """Return CARE train/validation, calibration, and optional official tests.
 
     Rows with identical normalized sequences are combined and all their EC1
     labels are retained. The official CARE test is loaded only when
@@ -136,13 +136,20 @@ def load_care(
         "threshold_calibration": _to_dataset(proteins),
     }
     if test_csv is not None:
-        test_proteins = _read_protein_ec_csv(test_csv)
-        overlap = set(proteins["Sequence"]) & set(test_proteins["Sequence"])
-        if overlap:
-            raise ValueError(
-                f"CARE train/test contain {len(overlap)} identical sequences"
-            )
-        parts["test"] = _to_dataset(test_proteins)
+        multiple_tests = isinstance(test_csv, (list, tuple))
+        test_paths = list(test_csv) if multiple_tests else [test_csv]
+        test_keys = [f"test_{index}" for index in range(len(test_paths))]
+        if not multiple_tests:
+            test_keys = ["test"]
+        for test_key, test_path in zip(test_keys, test_paths):
+            test_proteins = _read_protein_ec_csv(test_path)
+            overlap = set(proteins["Sequence"]) & set(test_proteins["Sequence"])
+            if overlap:
+                raise ValueError(
+                    f"CARE train/test contain {len(overlap)} identical sequences "
+                    f"({test_path})"
+                )
+            parts[test_key] = _to_dataset(test_proteins)
 
     def tokenize(batch):
         sequences = [

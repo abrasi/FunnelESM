@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed CARE train/test comparison with torchrun and Zeus metrics."""
+"""Run fixed CARE full-train fits and evaluate every model on each test split."""
 
 from __future__ import annotations
 
@@ -10,41 +10,37 @@ import sys
 from pathlib import Path
 
 
-ARCHITECTURES = {
-    "baseline": (),
-    "mean_layer_6": (),
-    "mean_layers_4_8": (),
-    "pool_query_layer_6": (),
-    "pool_query_layers_4_8": (),
-}
-METRICS = (
-    "macro_f1", "micro_f1", "jaccard", "accuracy", "num_labels_predicted",
-    "macro_mcc", "top1_ec1_accuracy",
-    *(f"mcc_ec{i}" for i in range(1, 8)),
+ARCHITECTURES = (
+    "baseline",
+    "mean_layer_6",
+    "mean_layers_4_8",
+    "pool_query_layer_6",
+    "pool_query_layers_4_8",
 )
-RESOURCES = (
-    "train_gpu_energy_j", "train_gpu_energy_kwh", "train_time_s",
-    "threshold_calibration_gpu_energy_j", "threshold_calibration_gpu_energy_kwh",
-    "threshold_calibration_time_s", "pipeline_gpu_energy_j",
-    "pipeline_gpu_energy_kwh", "pipeline_time_s", "test_gpu_energy_j",
-    "test_gpu_energy_kwh", "test_time_s", "peak_gpu_memory_gb",
+METRICS = (
+    "top1_ec1_accuracy",
+    "macro_f1",
+    "micro_f1",
+    "jaccard",
+    "accuracy",
+    "macro_mcc",
 )
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate the frozen ESM-2 baseline and FunnelESM variants on "
-            "the official fixed CARE test split."
+            "Fit each selected CARE architecture on the complete training set "
+            "for five seeds, then test each fit on all supplied official splits."
         )
     )
     parser.add_argument("--train_csv", required=True)
-    parser.add_argument("--test_csv", required=True)
+    parser.add_argument("--test_csvs", nargs="+", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--pilot_selection_json")
-    parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--architectures", nargs="+", choices=tuple(ARCHITECTURES), default=tuple(ARCHITECTURES))
+    parser.add_argument("--pilot_dir")
+    parser.add_argument("--learning_rate", type=float)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--architectures", nargs="+", choices=ARCHITECTURES, default=ARCHITECTURES)
     parser.add_argument("--seeds", type=int, nargs="+", default=(42, 43, 44, 45, 46))
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--validation_seed", type=int, default=0)
@@ -62,37 +58,69 @@ def build_parser():
 
 
 def resolve_hyperparameters(args):
-    if args.pilot_selection_json:
-        if args.learning_rate is not None or args.epochs is not None:
-            raise ValueError("Use pilot_selection_json or manual LR/epochs, not both")
-        selection_path = Path(args.pilot_selection_json).resolve()
-        selection = json.loads(selection_path.read_text(encoding="utf-8"))
-        chosen = selection.get("architectures", {})
-        result = {}
+    if args.pilot_dir:
+        if args.learning_rate is None or args.epochs is not None:
+            raise ValueError(
+                "With --pilot_dir, pass the common --learning_rate; epochs are "
+                "selected per architecture from pilot_summary.json."
+            )
+        pilot_dir = Path(args.pilot_dir).resolve()
+        manifest = json.loads(
+            (pilot_dir / "pilot_manifest.json").read_text(encoding="utf-8")
+        )
+        summaries = json.loads(
+            (pilot_dir / "pilot_summary.json").read_text(encoding="utf-8")
+        )
+        rates = sorted(float(value) for value in manifest["learning_rates"])
+        at_boundary = len(rates) > 1 and args.learning_rate in (rates[0], rates[-1])
+        configs = {}
+        problems = []
         for architecture in args.architectures:
-            item = chosen.get(architecture)
-            if item is None or "learning_rate" not in item or "epochs" not in item:
-                raise ValueError(f"No pilot configuration for {architecture}")
-            if not item.get("ready_for_final", False) and not args.allow_unready_selection:
-                raise ValueError(
-                    f"Pilot selection for {architecture} is not marked ready; "
-                    "expand the pilot or pass --allow_unready_selection."
-                )
-            result[architecture] = {
-                "learning_rate": float(item["learning_rate"]),
-                "epochs": int(item["epochs"]),
+            candidates = [
+                row for row in summaries
+                if row["architecture"] == architecture
+                and abs(float(row["learning_rate"]) - args.learning_rate) < 1e-12
+            ]
+            if not candidates:
+                problems.append(f"{architecture}: no run at LR={args.learning_rate:g}")
+                continue
+            best = min(candidates, key=lambda row: row["best_validation_loss"])
+            if not best.get("converged", False):
+                problems.append(f"{architecture}: validation loss did not plateau")
+            configs[architecture] = {
+                "learning_rate": float(args.learning_rate),
+                "epochs": int(best["best_epoch"]),
+                "pilot_best_validation_loss": float(best["best_validation_loss"]),
             }
-        return result
+        if at_boundary:
+            problems.append("the requested common LR is at the pilot search boundary")
+        if problems and not args.allow_unready_selection:
+            raise ValueError(
+                "Pilot configuration is not ready: " + "; ".join(problems)
+                + ". Expand the pilot search or explicitly pass --allow_unready_selection."
+            )
+        return configs, {
+            "pilot_dir": str(pilot_dir),
+            "learning_rate_source": "common learning rate selected from pilot runs",
+            "at_search_boundary": at_boundary,
+            "warnings": problems,
+        }
+
     if args.learning_rate is None or args.epochs is None:
         raise ValueError(
-            "Pass --pilot_selection_json or both --learning_rate and --epochs"
+            "Pass --pilot_dir plus --learning_rate, or pass both "
+            "--learning_rate and --epochs."
         )
     if args.learning_rate <= 0 or args.epochs < 1:
         raise ValueError("learning_rate and epochs must be positive")
-    return {
-        architecture: {"learning_rate": args.learning_rate, "epochs": args.epochs}
+    configs = {
+        architecture: {
+            "learning_rate": float(args.learning_rate),
+            "epochs": int(args.epochs),
+        }
         for architecture in args.architectures
     }
+    return configs, {"learning_rate_source": "manual", "warnings": []}
 
 
 def mean_std(values):
@@ -101,17 +129,62 @@ def mean_std(values):
     return {"mean": float(mean), "std": float(std)}
 
 
+def summarize(records, architectures, test_names):
+    result = {}
+    for architecture in architectures:
+        architecture_runs = [
+            run for run in records if run["architecture"] == architecture
+        ]
+        if not architecture_runs:
+            continue
+        summary = {
+            "n_seeds": len(architecture_runs),
+            "seeds": [run["seed"] for run in architecture_runs],
+            "learning_rate": architecture_runs[0]["learning_rate"],
+            "epochs": architecture_runs[0]["epochs"],
+            "train_gpu_energy_kwh": mean_std([
+                run["resources"]["train_gpu_energy_kwh"] for run in architecture_runs
+            ]),
+            "train_time_s": mean_std([
+                run["resources"]["train_time_s"] for run in architecture_runs
+            ]),
+            "peak_gpu_memory_gb": mean_std([
+                run["resources"]["peak_gpu_memory_gb"] for run in architecture_runs
+            ]),
+            "tests": {},
+        }
+        for test_name in test_names:
+            test_summary = {"metrics": {}, "resources": {}}
+            metric_names = architecture_runs[0]["test_metrics"][test_name]["metrics"].keys()
+            for metric in metric_names:
+                test_summary["metrics"][metric] = mean_std([
+                    run["test_metrics"][test_name]["metrics"][metric]
+                    for run in architecture_runs
+                ])
+            for resource in ("gpu_energy_kwh", "time_s"):
+                test_summary["resources"][resource] = mean_std([
+                    run["resources"]["test_by_split"][test_name][resource]
+                    for run in architecture_runs
+                ])
+            summary["tests"][test_name] = test_summary
+        result[architecture] = summary
+    return result
+
+
 def main():
     args = build_parser().parse_args()
     if args.batch_size < 1 or args.nproc_per_node < 1 or not args.seeds:
         raise ValueError("batch_size, nproc_per_node, and seeds must be positive")
     if not 0 < args.validation_size < 1:
         raise ValueError("validation_size must be between 0 and 1")
-    hyperparameters = resolve_hyperparameters(args)
+    test_paths = [Path(path).resolve() for path in args.test_csvs]
+    test_names = [path.stem for path in test_paths]
+    if len(set(test_names)) != len(test_names):
+        raise ValueError("Test CSV basenames must be unique")
+    hyperparameters, selection_info = resolve_hyperparameters(args)
 
     root = Path(__file__).resolve().parents[1]
     train_csv = Path(args.train_csv).resolve()
-    test_csv = Path(args.test_csv).resolve()
     output = Path(args.output_dir)
     if not output.is_absolute():
         output = root / output
@@ -125,13 +198,16 @@ def main():
             command = [
                 sys.executable, "-m", "torch.distributed.run", "--standalone",
                 f"--nproc_per_node={args.nproc_per_node}",
-                str(root / "scripts" / "train_care.py"),
-                "--train_csv", str(train_csv), "--test_csv", str(test_csv),
-                "--output_dir", str(run_dir), "--architecture", architecture,
+                str(root / "scripts" / "train_care_final.py"),
+                "--train_csv", str(train_csv),
+                "--test_csvs", *[str(path) for path in test_paths],
+                "--output_dir", str(run_dir),
+                "--architecture", architecture,
                 "--epochs", str(config["epochs"]),
                 "--batch_size", str(args.batch_size),
                 "--learning_rate", str(config["learning_rate"]),
-                "--seed", str(seed), "--validation_seed", str(args.validation_seed),
+                "--seed", str(seed),
+                "--validation_seed", str(args.validation_seed),
                 "--validation_size", str(args.validation_size),
                 "--max_residues", str(args.max_residues),
                 "--focal_gamma", str(args.focal_gamma),
@@ -139,7 +215,10 @@ def main():
                 "--mixed_precision", args.mixed_precision,
             ]
             if args.cluster_metadata_csv:
-                command.extend(["--cluster_metadata_csv", str(Path(args.cluster_metadata_csv).resolve())])
+                command.extend([
+                    "--cluster_metadata_csv",
+                    str(Path(args.cluster_metadata_csv).resolve()),
+                ])
             runs.append({
                 "architecture": architecture,
                 "seed": seed,
@@ -149,20 +228,17 @@ def main():
             })
 
     manifest = {
-        "purpose": "CARE fixed official train/test evaluation; no cross-validation",
+        "purpose": "CARE final: full official train fit, fixed hyperparameters, test all official splits with same model",
         "train_csv": str(train_csv),
-        "test_csv": str(test_csv),
-        "pilot_selection_json": (
-            str(Path(args.pilot_selection_json).resolve())
-            if args.pilot_selection_json else None
-        ),
+        "test_csvs": [str(path) for path in test_paths],
+        "test_names": test_names,
+        "test_used_for_selection": False,
+        "selection": selection_info,
         "hyperparameters": hyperparameters,
         "architectures": list(args.architectures),
         "seeds": list(args.seeds),
         "batch_size_per_device": args.batch_size,
         "effective_train_batch_size": args.batch_size * args.nproc_per_node,
-        "validation_seed": args.validation_seed,
-        "validation_size": args.validation_size,
         "cluster_metadata_csv": (
             str(Path(args.cluster_metadata_csv).resolve())
             if args.cluster_metadata_csv else None
@@ -172,24 +248,25 @@ def main():
         "mixed_precision": args.mixed_precision,
         "model_name": args.model_name,
         "nproc_per_node": args.nproc_per_node,
-        "test_used_for_selection": False,
+        "final_fit_uses_full_train": True,
+        "final_fit_validation": False,
         "runs": runs,
     }
     manifest_path = output / "final_experiment_manifest.json"
     if args.skip_existing and manifest_path.exists():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
-        keys = (
-            "train_csv", "test_csv", "pilot_selection_json", "hyperparameters",
-            "architectures", "seeds", "batch_size_per_device", "validation_seed",
-            "validation_size", "cluster_metadata_csv", "focal_gamma",
-            "max_residues", "mixed_precision", "model_name", "nproc_per_node",
+        compare_keys = (
+            "train_csv", "test_csvs", "test_names", "selection", "hyperparameters",
+            "architectures", "seeds", "batch_size_per_device", "cluster_metadata_csv",
+            "focal_gamma", "max_residues", "mixed_precision", "model_name",
+            "nproc_per_node",
         )
-        if any(old.get(key) != manifest.get(key) for key in keys):
-            raise RuntimeError("Final manifest differs from this configuration; use a new output directory")
+        if any(old.get(key) != manifest.get(key) for key in compare_keys):
+            raise RuntimeError("Final manifest differs; use a new output directory")
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Final manifest: {manifest_path}", flush=True)
 
-    grouped = {architecture: [] for architecture in args.architectures}
+    records = []
     for run in runs:
         result_path = Path(run["output_dir"]) / "run_result.json"
         print("\n" + " ".join(run["command"]), flush=True)
@@ -197,32 +274,23 @@ def main():
             continue
         if args.skip_existing and result_path.exists():
             result = json.loads(result_path.read_text(encoding="utf-8"))
-            print(f"Reusing completed run: {run['output_dir']}", flush=True)
         else:
             subprocess.run(run["command"], cwd=root, check=True)
             result = json.loads(result_path.read_text(encoding="utf-8"))
-        grouped[run["architecture"]].append(result)
+        result.update({
+            "architecture": run["architecture"],
+            "seed": run["seed"],
+            "learning_rate": run["learning_rate"],
+            "epochs": run["epochs"],
+        })
+        records.append(result)
 
     if args.dry_run:
         return
-    summary = {}
-    for architecture, records in grouped.items():
-        if not records:
-            continue
-        architecture_summary = {
-            "n_seeds": len(records),
-            "seeds": [record["seed"] for record in records],
-        }
-        for key in METRICS:
-            architecture_summary[key] = mean_std(
-                [float(record["test_metrics"][key]) for record in records]
-            )
-        for key in RESOURCES:
-            architecture_summary[key] = mean_std(
-                [float(record["resources"][key]) for record in records]
-            )
-        summary[architecture] = architecture_summary
-    results = {"runs": grouped, "summary": summary}
+    results = {
+        "runs": records,
+        "summary": summarize(records, args.architectures, test_names),
+    }
     results_path = output / "care_final_results.json"
     results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Final results: {results_path}", flush=True)
