@@ -8,6 +8,7 @@ import csv
 import gc
 import importlib.metadata
 import json
+import os
 import platform
 from pathlib import Path
 
@@ -15,7 +16,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
     DataCollatorWithPadding,
     Trainer,
@@ -33,9 +33,11 @@ from funnel_esm.metrics import (
     label_metric_name,
     optimize_mcc_thresholds,
     sigmoid,
+    summarize_metrics,
 )
 from funnel_esm.modeling_classification import (
     MaskedAttentionEsmForSequenceClassification,
+    load_pretrained_classifier,
 )
 
 
@@ -47,12 +49,6 @@ def package_version(*distribution_names):
         except importlib.metadata.PackageNotFoundError:
             continue
     return "unknown"
-
-
-ROPE_KEY_MAPPING = {
-    "esm.encoder.layer.*.attention.self.rotary_embeddings.inv_freq":
-        "esm.rotary_embeddings.inv_freq",
-}
 
 
 RESULT_NAMES = (
@@ -82,6 +78,8 @@ def build_parser():
     parser.add_argument("--dataset_path", required=True)
     parser.add_argument("--output_dir", default="outputs/baseline")
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--max_residues", type=int, default=1022)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument(
         "--learning_rate",
@@ -113,9 +111,7 @@ def build_parser():
         choices=range(5),
         default=None,
         metavar="FOLD",
-        help=(
-            "DeepLoc folds to run (0-4). By default, run all five folds."
-        ),
+        help=("DeepLoc folds to run (0-4). By default, run all five folds."),
     )
     parser.add_argument(
         "--eval_each_epoch",
@@ -149,19 +145,11 @@ def parse_args():
 
 
 def load_model(args):
-    config = AutoConfig.from_pretrained(args.model_name)
-    config.num_labels = len(DEEPLOC_LABELS)
-    config.problem_type = "multi_label_classification"
-    config.deeploc_focal_gamma = args.focal_gamma
-    config.id2label = dict(enumerate(DEEPLOC_LABELS))
-    config.label2id = {
-        label: index for index, label in enumerate(DEEPLOC_LABELS)
-    }
-
-    return MaskedAttentionEsmForSequenceClassification.from_pretrained(
+    return load_pretrained_classifier(
+        MaskedAttentionEsmForSequenceClassification,
         args.model_name,
-        config=config,
-        key_mapping=ROPE_KEY_MAPPING,
+        DEEPLOC_LABELS,
+        args.focal_gamma,
     )
 
 
@@ -254,18 +242,12 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         use_internal_validation=final_experiment,
         internal_validation_size=2048,
         internal_validation_seed=0,
+        max_residues=args.max_residues,
     )
-    label_weights = inverse_frequency_label_weights(
-        datasets["train"]["labels"]
-    )
+    label_weights = inverse_frequency_label_weights(datasets["train"]["labels"])
 
     model = model_loader(args)
-    model.set_label_weights(
-        torch.tensor(label_weights, dtype=torch.float32)
-    )
-
-    for parameter in model.base_model.parameters():
-        parameter.requires_grad = False
+    model.set_label_weights(torch.tensor(label_weights, dtype=torch.float32))
 
     training_args = TrainingArguments(
         output_dir=str(fold_output_dir),
@@ -273,6 +255,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         eval_strategy="epoch",
         logging_strategy="epoch",
         save_strategy="epoch" if final_experiment else "no",
@@ -301,15 +284,11 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
     )
 
     if trainer.is_world_process_zero():
-        world_size = (
-            dist.get_world_size()
-            if dist.is_initialized()
-            else 1
-        )
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         protocol = {
             "training_arguments": training_args.to_dict(),
             "effective_train_batch_size": (
-                training_args.per_device_train_batch_size
+                training_args.train_batch_size
                 * training_args.gradient_accumulation_steps
                 * world_size
             ),
@@ -322,9 +301,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
                 "zeus": package_version("zeus", "zeus-ml"),
                 "cuda_runtime": torch.version.cuda,
                 "cudnn": torch.backends.cudnn.version(),
-                "gpu": torch.cuda.get_device_name(
-                    torch.cuda.current_device()
-                ),
+                "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
                 "world_size": world_size,
             },
         }
@@ -334,9 +311,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
                 "internal_validation_size": 2048,
                 "internal_validation_seed": 0,
                 "checkpoint_selection_data": "internal_validation",
-                "threshold_calibration_data": (
-                    "four_official_outer_training_partitions"
-                ),
+                "threshold_calibration_data": ("four_official_outer_training_partitions"),
                 "outer_evaluation_labels_used_before_evaluation": False,
             }
         protocol_path = fold_output_dir / "training_protocol.json"
@@ -370,10 +345,10 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
             encoding="utf-8",
         )
 
-    local_peak_memory_gb = max(
-        torch.cuda.max_memory_allocated(gpu_index)
-        for gpu_index in monitored_gpus
-    ) / 1_000_000_000
+    local_peak_memory_gb = (
+        max(torch.cuda.max_memory_allocated(gpu_index) for gpu_index in monitored_gpus)
+        / 1_000_000_000
+    )
 
     energy_j, time_s, memory_gb = aggregate_resources(
         measurement.total_energy,
@@ -402,15 +377,9 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         return fold_result
 
     if trainer.state.best_model_checkpoint is None:
-        raise RuntimeError(
-            "Final training finished without selecting a best checkpoint."
-        )
+        raise RuntimeError("Final training finished without selecting a best checkpoint.")
 
-    evaluation_records = [
-        record
-        for record in trainer.state.log_history
-        if "eval_loss" in record
-    ]
+    evaluation_records = [record for record in trainer.state.log_history if "eval_loss" in record]
     if not evaluation_records:
         raise RuntimeError("No epoch-level validation losses were recorded.")
     best_record = min(
@@ -429,9 +398,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
         sigmoid(calibration_output.predictions),
         calibration_output.label_ids,
     )
-    calibration_measurement = monitor.end_window(
-        calibration_window_name
-    )
+    calibration_measurement = monitor.end_window(calibration_window_name)
     (
         calibration_energy_j,
         calibration_time_s,
@@ -467,15 +434,11 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
             "train_gpu_energy_j": energy_j,
             "train_gpu_energy_kwh": energy_j / 3_600_000,
             "train_time_s": time_s,
-            "threshold_calibration_gpu_energy_j":
-                calibration_energy_j,
-            "threshold_calibration_gpu_energy_kwh":
-                calibration_energy_j / 3_600_000,
+            "threshold_calibration_gpu_energy_j": calibration_energy_j,
+            "threshold_calibration_gpu_energy_kwh": calibration_energy_j / 3_600_000,
             "threshold_calibration_time_s": calibration_time_s,
-            "pipeline_gpu_energy_j":
-                energy_j + calibration_energy_j,
-            "pipeline_gpu_energy_kwh":
-                (energy_j + calibration_energy_j) / 3_600_000,
+            "pipeline_gpu_energy_j": energy_j + calibration_energy_j,
+            "pipeline_gpu_energy_kwh": (energy_j + calibration_energy_j) / 3_600_000,
             "pipeline_time_s": time_s + calibration_time_s,
             "peak_gpu_memory_gb": memory_gb,
         }
@@ -499,9 +462,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
                 "internal_validation_seed": 0,
                 "best_metric": float(trainer.state.best_metric),
                 "best_epoch": float(best_record["epoch"]),
-                "best_model_checkpoint": (
-                    trainer.state.best_model_checkpoint
-                ),
+                "best_model_checkpoint": (trainer.state.best_model_checkpoint),
                 "maximum_epochs": args.epochs,
                 "early_stopping": False,
             },
@@ -552,18 +513,7 @@ def train_fold(args, tokenizer, fold, model_loader=load_model):
 
 
 def summarize_results(fold_results):
-    summary = {}
-    for name in RESULT_NAMES:
-        values = [result[name] for result in fold_results]
-        summary[name] = {
-            "mean": float(np.mean(values)),
-            "std": (
-                float(np.std(values, ddof=0))
-                if len(values) > 1
-                else None
-            ),
-        }
-    return summary
+    return summarize_metrics(fold_results, RESULT_NAMES)
 
 
 def print_summary(summary):
@@ -572,23 +522,16 @@ def print_summary(summary):
         if values["std"] is None:
             print(f"{name}: {values['mean']:.6f} (un solo fold)")
         else:
-            print(
-                f"{name}: {values['mean']:.6f} "
-                f"± {values['std']:.6f}"
-            )
+            print(f"{name}: {values['mean']:.6f} ± {values['std']:.6f}")
 
 
 def run(args, model_loader=load_model) -> None:
     if args.convergence_pilot and not args.eval_each_epoch:
-        raise ValueError(
-            "--convergence_pilot requires --eval_each_epoch"
-        )
+        raise ValueError("--convergence_pilot requires --eval_each_epoch")
     if not torch.cuda.is_available():
         raise RuntimeError("Este script requiere al menos una GPU CUDA.")
-    if (
-        args.mixed_precision == "bf16"
-        and not torch.cuda.is_bf16_supported()
-    ):
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if args.mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError(
             "La GPU no soporta BF16. Usa --mixed_precision no para "
             "ejecutar en FP32; no cambies automáticamente a FP16."
@@ -599,19 +542,11 @@ def run(args, model_loader=load_model) -> None:
     folds = args.folds if args.folds is not None else range(5)
 
     for fold in folds:
-        fold_result_path = (
-            Path(args.output_dir) / f"fold_{fold}" / "fold_result.json"
-        )
-        if (
-            args.skip_existing_folds
-            and not args.convergence_pilot
-            and fold_result_path.exists()
-        ):
+        fold_result_path = Path(args.output_dir) / f"fold_{fold}" / "fold_result.json"
+        if args.skip_existing_folds and not args.convergence_pilot and fold_result_path.exists():
             if not dist.is_initialized() or dist.get_rank() == 0:
                 print(f"Reusing completed fold {fold}: {fold_result_path}")
-                result = json.loads(
-                    fold_result_path.read_text(encoding="utf-8")
-                )
+                result = json.loads(fold_result_path.read_text(encoding="utf-8"))
             else:
                 result = None
             if dist.is_initialized():
@@ -634,10 +569,7 @@ def run(args, model_loader=load_model) -> None:
                 json.dumps(results, indent=2),
                 encoding="utf-8",
             )
-            print(
-                "\nPiloto completado. Curvas y recursos guardados en: "
-                f"{results_path}"
-            )
+            print(f"\nPiloto completado. Curvas y recursos guardados en: {results_path}")
             return
 
         summary = summarize_results(fold_results)

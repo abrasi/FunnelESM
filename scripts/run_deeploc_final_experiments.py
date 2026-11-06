@@ -9,26 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-EXPERIMENTS = (
-    ("baseline", "train_baseline.py", ()),
-    ("mean_layer_6", "train_funnel.py", ("--pool_after_layers", "6")),
-    (
-        "mean_layers_4_8",
-        "train_funnel.py",
-        ("--pool_after_layers", "4", "8"),
-    ),
-    (
-        "pool_query_layer_6",
-        "train_funnel_pool_query.py",
-        ("--pool_after_layers", "6"),
-    ),
-    (
-        "pool_query_layers_4_8",
-        "train_funnel_pool_query.py",
-        ("--pool_after_layers", "4", "8"),
-    ),
-)
+EXPERIMENTS = {
+    'baseline': ('train_deeploc_baseline.py', []),
+    'mean_layer_6': ('train_funnel.py', [6]),
+    'mean_layers_4_8': ('train_funnel.py', [4, 8]),
+    'pool_query_layer_6': ('train_funnel_pool_query.py', [6]),
+    'pool_query_layers_4_8': ('train_funnel_pool_query.py', [4, 8]),
+}
 
 PROTOCOL_VERSION = 2
 
@@ -97,7 +84,7 @@ def main():
         output_root = project_root / output_root
 
     runs = []
-    for name, script_name, extra_args in EXPERIMENTS:
+    for name, (script_name, pool_after_layers) in EXPERIMENTS.items():
         run_output_dir = output_root / name
         command = [
             sys.executable,
@@ -129,7 +116,7 @@ def main():
             "3",
             "4",
             *(("--skip_existing_folds",) if args.skip_existing else ()),
-            *extra_args,
+            *(["--pool_after_layers", *map(str, pool_after_layers)] if pool_after_layers else []),
         ]
         runs.append(
             {

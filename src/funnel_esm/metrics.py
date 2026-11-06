@@ -19,10 +19,7 @@ def label_metric_name(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
 
 
-MCC_METRIC_NAMES = tuple(
-    f"mcc_{label_metric_name(label)}"
-    for label in DEEPLOC_LABELS
-)
+MCC_METRIC_NAMES = tuple(f"mcc_{label_metric_name(label)}" for label in DEEPLOC_LABELS)
 
 
 def sigmoid(logits):
@@ -52,8 +49,9 @@ def inverse_frequency_label_weights(labels):
 def optimize_mcc_thresholds(probabilities, labels):
     """Choose one exact MCC-maximizing threshold per label.
 
-    Candidate thresholds are the distinct probabilities produced on the
-    training split. Ties prefer the higher threshold.
+    Predictions use probability > threshold. Candidates are the distinct
+    training probabilities and one cut below the minimum (all positive).
+    Ties prefer the higher threshold.
     """
     probabilities = np.asarray(probabilities, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.int64)
@@ -70,9 +68,7 @@ def optimize_mcc_thresholds(probabilities, labels):
 
         true_positives = np.cumsum(sorted_targets)
         false_positives = np.cumsum(1 - sorted_targets)
-        group_ends = np.flatnonzero(
-            np.r_[sorted_scores[:-1] != sorted_scores[1:], True]
-        )
+        group_ends = np.flatnonzero(np.r_[sorted_scores[:-1] != sorted_scores[1:], True])
 
         tp = true_positives[group_ends].astype(np.float64)
         fp = false_positives[group_ends].astype(np.float64)
@@ -81,9 +77,7 @@ def optimize_mcc_thresholds(probabilities, labels):
         fn = positives - tp
         tn = negatives - fp
 
-        denominator = np.sqrt(
-            (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
-        )
+        denominator = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
         mcc = np.divide(
             tp * tn - fp * fn,
             denominator,
@@ -91,13 +85,11 @@ def optimize_mcc_thresholds(probabilities, labels):
             where=denominator > 0,
         )
         candidate_thresholds = np.r_[
-            np.nextafter(sorted_scores[0], np.inf),
             sorted_scores[group_ends],
+            np.nextafter(sorted_scores[-1], -np.inf),
         ]
         candidate_mcc = np.r_[0.0, mcc]
-        thresholds[label_index] = candidate_thresholds[
-            np.argmax(candidate_mcc)
-        ]
+        thresholds[label_index] = candidate_thresholds[np.argmax(candidate_mcc)]
 
     return thresholds
 
@@ -142,9 +134,7 @@ def multilabel_metrics(
     labels = np.asarray(labels, dtype=np.int64)
     label_names = tuple(label_names)
     if labels.ndim != 2 or labels.shape[1] != len(label_names):
-        raise ValueError(
-            "labels must contain one column for every label name"
-        )
+        raise ValueError("labels must contain one column for every label name")
     predictions = apply_thresholds(
         probabilities,
         thresholds,
@@ -171,12 +161,8 @@ def multilabel_metrics(
             average="samples",
             zero_division=0,
         ),
-        "accuracy": float(
-            np.all(predictions == labels, axis=1).mean()
-        ),
-        "num_labels_predicted": float(
-            predictions.sum(axis=1).mean()
-        ),
+        "accuracy": float(np.all(predictions == labels, axis=1).mean()),
+        "num_labels_predicted": float(predictions.sum(axis=1).mean()),
     }
 
     per_label_mcc = []
@@ -216,3 +202,43 @@ def build_compute_metrics(
 
 
 compute_metrics = build_compute_metrics()
+
+
+def compute_care_metrics(prediction):
+    """CARE multilabel scores at 0.5, plus top-1 EC1 any-hit accuracy."""
+    from funnel_esm.care import CARE_LABELS
+
+    probabilities = sigmoid(prediction.predictions)
+    labels = np.asarray(prediction.label_ids, dtype=np.int64)
+    metrics = multilabel_metrics(
+        labels,
+        probabilities,
+        np.full(len(CARE_LABELS), 0.5),
+        force_at_least_one=False,
+        inclusive=False,
+        label_names=CARE_LABELS,
+    )
+    predicted = np.argmax(probabilities, axis=1)
+    metrics["top1_ec1_accuracy"] = float(labels[np.arange(len(labels)), predicted].mean())
+    return metrics
+
+
+def summarize_metrics(rows, names=None):
+    """Mean and population std across independent runs; null stays unmeasured."""
+    if not rows:
+        raise ValueError("No completed results to summarize")
+    if names is None:
+        names = [
+            key
+            for key, value in rows[0].items()
+            if value is None or isinstance(value, (int, float, np.number))
+        ]
+    summary = {}
+    for name in names:
+        values = [row[name] for row in rows]
+        measured = all(value is not None for value in values)
+        summary[name] = {
+            "mean": float(np.mean(values)) if measured else None,
+            "std": float(np.std(values, ddof=0)) if measured and len(values) > 1 else None,
+        }
+    return summary

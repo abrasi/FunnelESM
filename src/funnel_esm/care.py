@@ -1,8 +1,7 @@
-"""CARE Task 1 data loading for direct EC level-1 multilabel learning."""
-
-from __future__ import annotations
+"""CARE EC1: merge annotations, split training data, and tokenize sequences."""
 
 import re
+from pathlib import Path
 
 import pandas as pd
 from datasets import Dataset, DatasetDict
@@ -10,159 +9,123 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from funnel_esm.deeploc import truncate_protein_middle
 
-
 CARE_LABELS = tuple(f"EC{i}" for i in range(1, 8))
+VALID_EC = re.compile(r"[1-7]\.(?:\d+|-)\.(?:\d+|-)\.(?:\d+|n\d+|-)")
 
 
-def _normalize_sequence(value):
-    if not isinstance(value, str):
-        return None
-    sequence = re.sub(r"\s+", "", value).upper()
-    return sequence or None
+def normalize_sequence(value):
+    sequence = re.sub(r"\s+", "", str(value)).upper()
+    if not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWYBXZUO]+", sequence):
+        raise ValueError(f"Invalid protein sequence: {sequence[:30]!r}")
+    return sequence
 
 
-def _read_protein_ec_csv(csv_path):
-    frame = pd.read_csv(csv_path, dtype={"EC number": str}, sep="\t")
-    required = {"Sequence", "EC number"}
-    missing = required.difference(frame.columns)
+def read_care(path):
+    """One example per sequence, with the union of all its EC1 annotations."""
+    frame = pd.read_csv(path, dtype=str, sep=None, engine="python", keep_default_na=False)
+    frame.columns = frame.columns.str.strip()
+    missing = {"Entry", "Sequence", "EC number"} - set(frame.columns)
     if missing:
-        raise ValueError(
-            f"{csv_path} is missing columns: {', '.join(sorted(missing))}"
-        )
-    frame = frame.dropna(subset=["Sequence", "EC number"]).copy()
-    frame["Sequence"] = frame["Sequence"].map(_normalize_sequence)
-    frame["ec1"] = frame["EC number"].astype(str).str.extract(
-        r"^\s*([1-7])(?:\.|\s|$)"
-    )[0]
-    frame = frame.dropna(subset=["Sequence", "ec1"])
+        raise ValueError(f"{path}: missing columns {sorted(missing)}")
     if frame.empty:
-        raise ValueError(f"No valid sequence/EC1 records found in {csv_path}")
+        raise ValueError(f"{path}: empty dataset")
+    frame["Sequence"] = frame["Sequence"].map(normalize_sequence)
+    frame["Entry"] = frame["Entry"].str.strip()
+    if (frame["Entry"] == "").any() or (frame.groupby("Entry")["Sequence"].nunique() > 1).any():
+        raise ValueError(f"{path}: empty Entry or an Entry has multiple sequences")
 
-    records = []
+    labels = []
+    for line, cell in enumerate(frame["EC number"], 2):
+        annotations = [ec.strip() for ec in cell.split(";")]
+        if any(not VALID_EC.fullmatch(ec) for ec in annotations):
+            raise ValueError(f"{path}:{line}: invalid EC annotation {cell!r}")
+        labels.append({ec[0] for ec in annotations})
+    frame["ec1"] = labels
+
+    proteins = []
     for sequence, rows in frame.groupby("Sequence", sort=False):
-        entries = (
-            rows["Entry"].dropna().astype(str).unique()
-            if "Entry" in rows.columns
-            else []
-        )
-        records.append(
+        proteins.append(
             {
                 "Sequence": sequence,
-                "ec1": sorted(set(rows["ec1"].astype(str))),
-                "protein_id": "|".join(entries)
-                if len(entries)
-                else f"sequence_{len(records)}",
+                "protein_id": "|".join(rows["Entry"].unique()),
+                "ec1": sorted(set().union(*rows["ec1"])),
             }
         )
-    return pd.DataFrame.from_records(records)
+    return pd.DataFrame(proteins)
 
 
-def _cluster_groups(proteins, cluster_metadata_csv):
-    if cluster_metadata_csv is None:
+def cluster_groups(proteins, metadata_path):
+    if metadata_path is None:
         return proteins["Sequence"]
-
     metadata = pd.read_csv(
-        cluster_metadata_csv,
-        usecols=["Sequence", "clusterRes50"],
+        metadata_path, dtype=str, sep=None, engine="python", keep_default_na=False
     )
-    metadata["Sequence"] = metadata["Sequence"].map(_normalize_sequence)
-    metadata = metadata.dropna(subset=["Sequence", "clusterRes50"])
-    grouped = metadata.groupby("Sequence", sort=False)["clusterRes50"]
-    inconsistent = grouped.nunique()
-    inconsistent = inconsistent[inconsistent > 1]
-    if not inconsistent.empty:
+    metadata["Sequence"] = metadata["Sequence"].map(normalize_sequence)
+    if (metadata["clusterRes50"].str.strip() == "").any():
+        raise ValueError("Cluster metadata contains empty clusterRes50 values")
+    grouped = metadata.groupby("Sequence")["clusterRes50"]
+    if (grouped.nunique() > 1).any():
         raise ValueError("A sequence maps to multiple clusterRes50 values")
-    cluster_map = grouped.first()
-    groups = proteins["Sequence"].map(cluster_map)
+    groups = proteins["Sequence"].map(grouped.first())
     if groups.isna().any():
-        missing_count = int(groups.isna().sum())
-        raise ValueError(
-            f"Cluster metadata has no clusterRes50 for {missing_count} "
-            "training sequences"
-        )
-    return groups.astype(str)
+        raise ValueError("Cluster metadata must cover every training sequence")
+    return groups
 
 
-def _to_dataset(proteins):
-    rows = []
-    for record in proteins.itertuples(index=False):
-        rows.append(
-            {
-                "Sequence": record.Sequence,
-                "protein_id": record.protein_id,
-                "labels": [
-                    float(str(index) in record.ec1)
-                    for index in range(1, len(CARE_LABELS) + 1)
-                ],
-            }
-        )
-    return Dataset.from_list(rows)
+def check_disjoint(train, test):
+    if set(train["Sequence"]) & set(test["Sequence"]):
+        raise ValueError("CARE train/test contain identical sequences")
+    train_entries = {entry for ids in train["protein_id"] for entry in ids.split("|")}
+    test_entries = {entry for ids in test["protein_id"] for entry in ids.split("|")}
+    if train_entries & test_entries:
+        raise ValueError("CARE train/test share Entry identifiers")
+
+
+def tokenize_care(proteins, tokenizer, max_residues):
+    dataset = Dataset.from_dict(
+        {
+            "Sequence": proteins["Sequence"].tolist(),
+            "protein_id": proteins["protein_id"].tolist(),
+            "labels": [
+                [float(str(i) in labels) for i in range(1, 8)] for labels in proteins["ec1"]
+            ],
+        }
+    )
+
+    def tokenize(batch):
+        sequences = [truncate_protein_middle(s, max_residues) for s in batch["Sequence"]]
+        return tokenizer(sequences, truncation=False)
+
+    return dataset.map(tokenize, batched=True, remove_columns=["Sequence"])
 
 
 def load_care(
-    train_csv,
-    tokenizer,
-    test_csv=None,
-    validation_size=0.1,
-    validation_seed=0,
-    max_residues=1022,
-    cluster_metadata_csv=None,
+    train_csv, tokenizer, *, pilot=False, test_csvs=(), max_residues=1022, cluster_metadata_csv=None
 ):
-    """Return CARE train/validation, calibration, and optional official tests.
+    """Pilot: fixed 90/10 train/validation. Final: all train and official tests.
 
-    Rows with identical normalized sequences are combined and all their EC1
-    labels are retained. The official CARE test is loaded only when
-    ``test_csv`` is provided. In final runs, ``threshold_calibration`` is the
-    complete official training set, mirroring DeepLoc's use of outer-training
-    data for MCC threshold calibration.
+    Identical sequences are grouped before splitting. With metadata, whole
+    clusterRes50 groups stay together. Neither split discards annotations.
     """
-    if not 0 < validation_size < 1:
-        raise ValueError("validation_size must be between 0 and 1")
-
-    proteins = _read_protein_ec_csv(train_csv)
-    groups = _cluster_groups(proteins, cluster_metadata_csv)
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=validation_size,
-        random_state=validation_seed,
-    )
-    train_indices, validation_indices = next(
-        splitter.split(proteins, groups=groups)
-    )
-
-    parts = {
-        "train": _to_dataset(proteins.iloc[train_indices]),
-        "validation": _to_dataset(proteins.iloc[validation_indices]),
-        "threshold_calibration": _to_dataset(proteins),
-    }
-    if test_csv is not None:
-        multiple_tests = isinstance(test_csv, (list, tuple))
-        test_paths = list(test_csv) if multiple_tests else [test_csv]
-        test_keys = [f"test_{index}" for index in range(len(test_paths))]
-        if not multiple_tests:
-            test_keys = ["test"]
-        for test_key, test_path in zip(test_keys, test_paths):
-            test_proteins = _read_protein_ec_csv(test_path)
-            overlap = set(proteins["Sequence"]) & set(test_proteins["Sequence"])
-            if overlap:
-                raise ValueError(
-                    f"CARE train/test contain {len(overlap)} identical sequences "
-                    f"({test_path})"
-                )
-            parts[test_key] = _to_dataset(test_proteins)
-
-    def tokenize(batch):
-        sequences = [
-            truncate_protein_middle(sequence, max_residues)
-            for sequence in batch["Sequence"]
-        ]
-        encoded = tokenizer(sequences, truncation=False)
-        encoded["labels"] = batch["labels"]
-        encoded["protein_id"] = batch["protein_id"]
-        return encoded
-
-    return DatasetDict(parts).map(
-        tokenize,
-        batched=True,
-        remove_columns=["Sequence"],
+    if not 1 <= max_residues <= 1022:
+        raise ValueError("max_residues must be between 1 and 1022")
+    if pilot and test_csvs:
+        raise ValueError("A pilot must not load official tests")
+    proteins = read_care(train_csv)
+    if pilot:
+        groups = cluster_groups(proteins, cluster_metadata_csv)
+        splitter = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=0)
+        train_indices, val_indices = next(splitter.split(proteins, groups=groups))
+        parts = {"train": proteins.iloc[train_indices], "validation": proteins.iloc[val_indices]}
+    else:
+        parts = {"train": proteins}
+        for path in test_csvs:
+            name = Path(path).stem
+            if name in parts:
+                raise ValueError(f"Duplicate or reserved test name: {name}")
+            test = read_care(path)
+            check_disjoint(proteins, test)
+            parts[name] = test
+    return DatasetDict(
+        {name: tokenize_care(frame, tokenizer, max_residues) for name, frame in parts.items()}
     )

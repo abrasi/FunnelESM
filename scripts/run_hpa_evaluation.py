@@ -23,14 +23,17 @@ def build_parser():
         "--batch_size",
         type=int,
         default=None,
-        help="Defaults to the value stored in the final manifest.",
+        help="Inference batch size (default: 1), independent of training.",
     )
     parser.add_argument(
-        "--mixed_precision",
-        choices=("no", "fp16", "bf16"),
+        "--precision",
+        choices=("float32", "fp16", "bf16"),
         default=None,
-        help="Defaults to the value stored in the final manifest.",
+        help="Inference precision (default: float32), independent of training.",
     )
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--max_residues", type=int, default=1022)
     return parser
 
 
@@ -50,15 +53,21 @@ def main():
         str(Path(args.hpa_path).resolve()),
     ]
     if args.output_dir is not None:
-        command.extend(
-            ["--output_dir", str(Path(args.output_dir).resolve())]
-        )
+        command.extend(["--output_dir", str(Path(args.output_dir).resolve())])
     if args.batch_size is not None:
         command.extend(["--batch_size", str(args.batch_size)])
-    if args.mixed_precision is not None:
-        command.extend(
-            ["--mixed_precision", args.mixed_precision]
-        )
+    if args.precision is not None:
+        command.extend(["--precision", args.precision])
+    command.extend(
+        [
+            "--warmup",
+            str(args.warmup),
+            "--repeats",
+            str(args.repeats),
+            "--max_residues",
+            str(args.max_residues),
+        ]
+    )
     print(" ".join(command), flush=True)
     subprocess.run(command, cwd=project_root, check=True)
 
